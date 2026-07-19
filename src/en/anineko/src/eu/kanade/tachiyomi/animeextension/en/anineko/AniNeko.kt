@@ -253,8 +253,9 @@ class AniNeko :
                     val extractor = VidHideExtractor(client, headers)
                     extractor.videosFromUrl(iframeUrl) { quality -> "$versionType - $quality" }.map { video ->
                         Video(
+                            url = video.url,
+                            quality = video.quality,
                             videoUrl = video.videoUrl,
-                            videoTitle = video.videoTitle,
                             headers = video.headers,
                             subtitleTracks = video.subtitleTracks + subtitleTracks,
                         )
@@ -265,8 +266,9 @@ class AniNeko :
                     val extractor = DoodExtractor(client)
                     extractor.videosFromUrl(iframeUrl, quality = versionType).map { video ->
                         Video(
+                            url = video.url,
+                            quality = video.quality,
                             videoUrl = video.videoUrl,
-                            videoTitle = video.videoTitle,
                             headers = video.headers,
                             subtitleTracks = video.subtitleTracks + subtitleTracks,
                         )
@@ -286,15 +288,15 @@ class AniNeko :
 
         return videos
             .filter { video ->
-                val matchesServer = excludedServers.any { video.videoTitle.contains(it, ignoreCase = true) }
-                val matchesAudio = excludedAudios.any { video.videoTitle.contains(it, ignoreCase = true) }
+                val matchesServer = excludedServers.any { video.quality.contains(it, ignoreCase = true) }
+                val matchesAudio = excludedAudios.any { video.quality.contains(it, ignoreCase = true) }
                 !matchesServer && !matchesAudio
             }
             .sortedWith(
                 compareBy(
-                    { !it.videoTitle.contains(host, ignoreCase = true) },
-                    { !it.videoTitle.contains(quality, ignoreCase = true) },
-                    { !it.videoTitle.contains(type, ignoreCase = true) },
+                    { !it.quality.contains(host, ignoreCase = true) },
+                    { !it.quality.contains(quality, ignoreCase = true) },
+                    { !it.quality.contains(type, ignoreCase = true) },
                 ),
             )
     }
