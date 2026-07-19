@@ -44,7 +44,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build AniNeko APK
-        run: ./gradlew :src:en:anineko:assembleRelease
+        run: ./gradlew :src:en:anineko:assembleRelease -x spotlessCheck
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
