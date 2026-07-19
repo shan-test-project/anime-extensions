@@ -499,22 +499,39 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
     var port: Int = 0
         private set
 
+    /** True only when the local proxy server started successfully. */
+    val isAvailable: Boolean get() = port > 0
+
     init {
         try {
-            serverSocket = ServerSocket(0)
-            port = serverSocket!!.localPort
+            val ss = ServerSocket(0)
+            serverSocket = ss
+            port = ss.localPort
             executor.execute {
-                while (serverSocket?.isClosed == false) {
+                while (!ss.isClosed) {
                     try {
-                        val socket = serverSocket!!.accept()
+                        val socket = ss.accept()
                         executor.execute { handleSocket(socket) }
                     } catch (_: Exception) {}
                 }
             }
-        } catch (e: Exception) {}
+        } catch (_: Exception) {
+            // proxy server unavailable; isAvailable will return false
+        }
     }
 
+    /** Stop accepting new connections and release all resources. */
+    fun shutdown() {
+        try { serverSocket?.close() } catch (_: Exception) {}
+        executor.shutdownNow()
+    }
+
+    /**
+     * Returns a local proxy URL for [targetUrl], or [targetUrl] itself when the
+     * proxy server failed to start (port == 0).
+     */
     fun getProxyUrl(targetUrl: String, headers: okhttp3.Headers?): String {
+        if (!isAvailable) return targetUrl
         val encodedUrl = Base64.encodeToString(targetUrl.toByteArray(), Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
         val headersStr = headers?.let { h ->
             val sb = StringBuilder()
@@ -529,6 +546,7 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
     }
 
     private fun handleSocket(socket: Socket) {
+        var requestParsed = false
         try {
             val input = socket.getInputStream()
             val reader = input.bufferedReader()
@@ -592,13 +610,20 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
                 .headers(targetHeaders.build())
                 .build()
 
+            requestParsed = true
             client.newCall(request).execute().use { response ->
                 sendResponse(socket, response, targetUrl, encodedHeaders)
             }
         } catch (e: Exception) {
-            try {
-                sendError(socket, 500, e.message ?: "Internal Error")
-            } catch (_: Exception) {}
+            // Only attempt to send an HTTP error response when the request was
+            // fully parsed; otherwise the socket's streams may be in an
+            // inconsistent state and writing to them could throw or produce
+            // garbage on the wire.
+            if (requestParsed) {
+                try {
+                    sendError(socket, 500, e.message ?: "Internal Error")
+                } catch (_: Exception) {}
+            }
         } finally {
             try {
                 socket.close()
