@@ -12,9 +12,9 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
-import eu.kanade.tachiyomi.lib.doodextractor.DoodExtractor
-import eu.kanade.tachiyomi.lib.playlistutils.PlaylistUtils
-import eu.kanade.tachiyomi.lib.vidhideextractor.VidHideExtractor
+import aniyomi.lib.doodextractor.DoodExtractor
+import aniyomi.lib.playlistutils.PlaylistUtils
+import aniyomi.lib.vidhideextractor.VidHideExtractor
 import eu.kanade.tachiyomi.network.GET
 import keiyoushi.utils.addListPreference
 import keiyoushi.utils.addSetPreference
