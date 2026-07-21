@@ -1,0 +1,14 @@
+ext {
+    extName = 'hentai.tv'
+    extClass = '.HentaiTV'
+    extVersionCode = 1
+    isNsfw = true
+}
+
+apply plugin: "kei.plugins.extension.legacy"
+
+dependencies {
+    implementation(project(':lib:playlistutils'))
+}
+
+// v1.0 - initial release
