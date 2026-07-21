@@ -1,0 +1,54 @@
+name: Build hentai.tv APK
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'src/en/hentaitv/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build hentai.tv APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Generate debug signing key
+        run: |
+          keytool -genkeypair -v \
+            -keystore signingkey.jks \
+            -alias key0 \
+            -keyalg RSA -keysize 2048 \
+            -validity 10000 \
+            -storepass android \
+            -keypass android \
+            -dname "CN=hentaitv, OU=Extensions, O=hentaitv, L=Unknown, ST=Unknown, C=US"
+          echo "KEY_STORE_PASSWORD=android" >> $GITHUB_ENV
+          echo "ALIAS=key0"               >> $GITHUB_ENV
+          echo "KEY_PASSWORD=android"     >> $GITHUB_ENV
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build hentai.tv APK
+        run: ./gradlew :src:en:hentaitv:assembleRelease -x spotlessCheck
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: hentaitv-APK
+          path: src/en/hentaitv/build/outputs/apk/release/*.apk
+          if-no-files-found: error
