@@ -14,7 +14,11 @@ import eu.kanade.tachiyomi.network.GET
 import keiyoushi.utils.addListPreference
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parallelCatchingFlatMapBlocking
+import keiyoushi.utils.parseAs
 import keiyoushi.utils.useAsJsoup
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
@@ -28,170 +32,233 @@ class HentaiTV :
     override val lang = "en"
     override val supportsLatest = true
 
+    private val apiUrl = "https://guest.freeanimehentai.net/api/v11"
     private val preferences by getPreferencesLazy()
     private val playlistUtils by lazy { PlaylistUtils(client, headers) }
 
-    override fun headersBuilder() = super.headersBuilder()
+    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .set("Referer", "$baseUrl/")
+        .set("Origin", baseUrl)
         .set(
             "User-Agent",
             "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36",
         )
 
+    private fun apiHeaders(): Headers = headers.newBuilder()
+        .set("Accept", "application/json, text/plain, */*")
+        .set("Referer", "$baseUrl/")
+        .set("Origin", baseUrl)
+        .build()
+
     // ============================== Popular ===============================
 
     override fun popularAnimeRequest(page: Int): Request =
-        GET("$baseUrl/browse?sort=views&page=$page", headers)
+        buildApiRequest(page = page - 1, orderBy = "views")
 
     override fun popularAnimeParse(response: Response): AnimesPage =
-        parseCardPage(response)
+        parseApiResponse(response)
 
     // ============================== Latest ================================
 
     override fun latestUpdatesRequest(page: Int): Request =
-        GET("$baseUrl/browse?sort=recently_added&page=$page", headers)
+        buildApiRequest(page = page - 1, orderBy = "created_at_unix")
 
     override fun latestUpdatesParse(response: Response): AnimesPage =
-        parseCardPage(response)
+        parseApiResponse(response)
 
     // ============================== Search ================================
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val urlBuilder = "$baseUrl/browse".toHttpUrl().newBuilder()
-        urlBuilder.addQueryParameter("page", page.toString())
-        if (query.isNotBlank()) urlBuilder.addQueryParameter("q", query)
-        filters.forEach { filter ->
-            when (filter) {
-                is SortFilter -> if (!filter.isDefault()) urlBuilder.addQueryParameter("sort", filter.toUriPart())
-                is GenreFilter -> filter.getChecked().forEach { urlBuilder.addQueryParameter("genre[]", it) }
-                else -> {}
-            }
-        }
-        return GET(urlBuilder.build(), headers)
+        val sortFilter = filters.firstOrNull { it is SortFilter } as? SortFilter
+        val tagFilter = filters.firstOrNull { it is TagFilter } as? TagFilter
+        val orderBy = sortFilter?.toUriPart() ?: "created_at_unix"
+        val tags = tagFilter?.getChecked() ?: emptyList()
+        return buildApiRequest(page = page - 1, orderBy = orderBy, searchText = query, tags = tags)
     }
 
-    override fun searchAnimeParse(response: Response): AnimesPage = parseCardPage(response)
+    override fun searchAnimeParse(response: Response): AnimesPage =
+        parseApiResponse(response)
 
-    // =========================== Card Parsing ============================
+    // =========================== API Builder ==============================
 
-    /**
-     * Parse a browse/search/trending page with episode card grid.
-     * Cards are `<a href="/hentai/{slug}"><div class="card card--below">…</div></a>`.
-     * We group to series level by stripping the "-episode-N" suffix from the slug,
-     * deduplicating so each series appears only once.
-     */
-    private fun parseCardPage(response: Response): AnimesPage {
-        val document = response.useAsJsoup()
+    private fun buildApiRequest(
+        page: Int = 0,
+        orderBy: String = "created_at_unix",
+        searchText: String = "",
+        tags: List<String> = emptyList(),
+    ): Request {
+        val url = "$apiUrl/search_hvs".toHttpUrl().newBuilder().apply {
+            addQueryParameter("search_text", searchText)
+            if (tags.isEmpty()) {
+                addQueryParameter("tags[]", "")
+            } else {
+                tags.forEach { addQueryParameter("tags[]", it) }
+            }
+            addQueryParameter("tags_mode", "AND")
+            addQueryParameter("brands[]", "")
+            addQueryParameter("blacklist[]", "")
+            addQueryParameter("order_by", orderBy)
+            addQueryParameter("ordering", "desc")
+            addQueryParameter("page", page.toString())
+        }.build()
+        return GET(url, apiHeaders())
+    }
+
+    // =========================== Data Models ==============================
+
+    @Serializable
+    data class ApiVideo(
+        val id: Int = 0,
+        val name: String = "",
+        val slug: String = "",
+        val description: String? = null,
+        @SerialName("cover_url") val coverUrl: String? = null,
+        @SerialName("poster_url") val posterUrl: String? = null,
+        val brand: String? = null,
+        val tags: List<String> = emptyList(),
+        val views: Long = 0L,
+        @SerialName("created_at_unix") val createdAtUnix: Long = 0L,
+    ) {
+        /** The slug with the trailing episode number stripped, e.g. "my-series-1" → "my-series" */
+        val baseSlug: String get() = slug.replace(Regex("-\\d+$"), "")
+
+        /** The episode number extracted from the slug end, e.g. "my-series-3" → 3 */
+        val episodeNumber: Int get() = slug.removePrefix(baseSlug).trimStart('-').toIntOrNull() ?: 1
+
+        /** Convert API slug to the hentai.tv episode URL path.
+         *  "my-series-2" → "/hentai/my-series-episode-2" */
+        val episodeUrlPath: String
+            get() = "/hentai/${baseSlug}-episode-${episodeNumber}"
+    }
+
+    // =========================== API Parsing ==============================
+
+    private fun parseApiResponse(response: Response): AnimesPage {
+        val videos = response.parseAs<List<ApiVideo>>()
+
+        // Deduplicate by base slug so each series appears once in browse
         val seen = mutableSetOf<String>()
-        val animes = document.select("a:has(div.card)").mapNotNull { el ->
-            val href = el.attr("href").takeIf { it.contains("/hentai/") } ?: return@mapNotNull null
-            val seriesUrl = deriveSeriesUrl(href)
-            if (!seen.add(seriesUrl)) return@mapNotNull null
+        val animes = videos.mapNotNull { v ->
+            if (!seen.add(v.baseSlug)) return@mapNotNull null
             SAnime.create().apply {
-                setUrlWithoutDomain(seriesUrl)
-                // ownText() on card-title strips the nested "· EP N" span
-                title = el.selectFirst("div.card-title")?.ownText()?.trim()
-                    ?.ifBlank {
-                        el.selectFirst("div.card-title")?.text()
-                            ?.replace(Regex("\\s*·\\s*EP\\s*\\d+.*$"), "")?.trim()
-                    } ?: ""
-                val rawSrc = el.selectFirst("img.poster-img")?.attr("src") ?: ""
-                thumbnail_url = when {
-                    rawSrc.startsWith("http") -> rawSrc
-                    rawSrc.isNotBlank() -> "$baseUrl$rawSrc"
-                    else -> null
-                }
+                // Display title: strip trailing episode number digit
+                title = v.name.replace(Regex("\\s+\\d+$"), "").trim()
+                // Store base slug as URL so we can find all episodes later
+                setUrlWithoutDomain("/api/${v.baseSlug}")
+                thumbnail_url = v.coverUrl?.takeIf { it.isNotBlank() } ?: v.posterUrl
+                genre = v.tags.joinToString()
+                author = v.brand
+                description = v.description
+                    ?.replace(Regex("<[^>]+>"), "")  // strip HTML tags
+                    ?.trim()
             }
         }
-        // hentai.tv doesn't expose a "page N of M" counter in HTML; we infer
-        // hasNextPage from whether a full page of cards was returned.
-        val hasNextPage = document.select("a:has(div.card)").size >= 20
-        return AnimesPage(animes, hasNextPage)
-    }
 
-    /**
-     * Derive the series URL from an episode URL.
-     * /hentai/my-title-episode-3  →  /series/my-title
-     * /hentai/my-one-shot         →  /series/my-one-shot
-     */
-    private fun deriveSeriesUrl(episodeHref: String): String {
-        val slug = episodeHref.substringAfterLast("/hentai/").trimEnd('/')
-        val seriesSlug = slug.replace(Regex("-episode-\\d+$"), "")
-        return "/series/$seriesSlug"
+        // API returns 24 items per page; fewer → last page
+        val hasNextPage = videos.size >= 24
+        return AnimesPage(animes, hasNextPage)
     }
 
     // =========================== Anime Details ============================
 
-    override fun animeDetailsRequest(anime: SAnime): Request =
-        GET("$baseUrl${anime.url}", headers)
+    override fun animeDetailsRequest(anime: SAnime): Request {
+        val baseSlug = anime.url.removePrefix("/api/")
+        // Fetch the first episode page — it holds JSON-LD with full series metadata
+        return GET("$baseUrl/hentai/${baseSlug}-episode-1", headers)
+    }
 
     override fun animeDetailsParse(response: Response): SAnime {
         val document = response.useAsJsoup()
+        val ldJson = document.selectFirst("script[type='application/ld+json']")?.data() ?: ""
+
         return SAnime.create().apply {
-            title = document.selectFirst("h1.series-title, h1.watch-title, h1")?.text()?.trim() ?: ""
-            description = document.selectFirst(
-                "div.series-desc, p.series-desc, div.watch-desc, p.description, div.description",
-            )?.text()
-            genre = document.select(
-                "span.tag-chip, div.tag-chip, a.tag-chip, " +
-                    "span.footer-tag, a.footer-tag",
-            ).joinToString { it.text() }
-            val imgEl = document.selectFirst(
-                "img.series-cover, img.cover-img, img.poster-img, " +
-                    "div.series-poster img, div.watch-cover img",
-            )
-            thumbnail_url = imgEl?.attr("src")?.let { src ->
-                if (src.startsWith("http")) src else "$baseUrl$src"
+            // Title from <h1 class="watch-title"> (cleaner than JSON-LD which has site name appended)
+            val h1 = document.selectFirst("h1.watch-title")
+            title = if (h1 != null) {
+                // Remove episode span: "My Series <span>Episode 2</span>" → "My Series"
+                h1.ownText().trim().ifBlank {
+                    h1.text().replace(Regex("\\s*Episode\\s+\\d+.*", RegexOption.IGNORE_CASE), "").trim()
+                }
+            } else {
+                JSONLD_NAME_REGEX.find(ldJson)?.groupValues?.get(1)
+                    ?.replace(Regex("\\s+Episode\\s+\\d+.*", RegexOption.IGNORE_CASE), "")
+                    ?.replace(Regex("\\s*-\\s*Watch on.*", RegexOption.IGNORE_CASE), "")
+                    ?.trim() ?: ""
             }
+
+            // Description from JSON-LD (full and clean)
+            description = JSONLD_DESC_REGEX.find(ldJson)?.groupValues?.get(1)
+                ?.replace(Regex("<[^>]+>"), "")
+                ?.replace("\\u003c", "<").replace("\\u003e", ">")
+                ?.replace(Regex("\\\\[rn]"), "\n")
+                ?.trim()
+
+            // Thumbnail from JSON-LD thumbnailUrl array
+            thumbnail_url = JSONLD_THUMB_REGEX.find(ldJson)?.groupValues?.get(1)
+
+            // Genres from tag-chip links on the page
+            genre = document.select("a.tag-chip").joinToString { it.text() }
+
+            // Studio / brand
+            author = document.selectFirst("a[href^='/brand/'], a[href^='/studio/']")?.text()
+
             status = SAnime.UNKNOWN
         }
     }
 
     // ============================== Episodes ==============================
 
-    override fun episodeListRequest(anime: SAnime): Request =
-        GET("$baseUrl${anime.url}", headers)
+    override fun episodeListRequest(anime: SAnime): Request {
+        val baseSlug = anime.url.removePrefix("/api/")
+        // Convert base slug to search text: "my-series-name" → "my series name"
+        val searchText = baseSlug.replace('-', ' ')
+        val url = "$apiUrl/search_hvs".toHttpUrl().newBuilder().apply {
+            addQueryParameter("search_text", searchText)
+            addQueryParameter("tags[]", "")
+            addQueryParameter("tags_mode", "AND")
+            addQueryParameter("brands[]", "")
+            addQueryParameter("blacklist[]", "")
+            addQueryParameter("order_by", "created_at_unix")
+            addQueryParameter("ordering", "asc")
+            addQueryParameter("page", "0")
+        }.build()
+        return GET(url, apiHeaders())
+    }
 
-    /**
-     * Parse episode list from the series page at /series/{slug}.
-     * Episodes are expected to appear as card links (`<a href="/hentai/…">`).
-     * Falls back to a single synthesised episode when the page has no episode links
-     * (handles one-shots whose slug has no "-episode-N" suffix).
-     */
     override fun episodeListParse(response: Response): List<SEpisode> {
-        val document = response.useAsJsoup()
+        // Recover base slug from the search_text query parameter we put in the request URL
+        val baseSlug = response.request.url.queryParameter("search_text")
+            ?.replace(' ', '-') ?: ""
 
-        val episodeEls = document.select("a:has(div.card)[href*='/hentai/'], a[href*='/hentai/']")
-            .distinctBy { it.attr("href") }
-            .filter { el -> el.attr("href").contains("/hentai/") }
+        val allVideos = response.parseAs<List<ApiVideo>>()
 
-        if (episodeEls.isNotEmpty()) {
-            return episodeEls.mapIndexed { index, el ->
-                val href = el.attr("href").let { if (it.startsWith("/")) it else "/$it" }
+        // Keep only episodes whose base slug exactly matches
+        val episodes = allVideos.filter { v ->
+            v.baseSlug == baseSlug ||
+                v.slug == baseSlug ||        // slug IS the base slug (single episode, no number)
+                v.slug.startsWith("$baseSlug-")
+        }.sortedBy { it.episodeNumber }
+
+        if (episodes.isEmpty()) {
+            // Fallback: create a synthetic single episode
+            return listOf(
                 SEpisode.create().apply {
-                    setUrlWithoutDomain(href)
-                    val epText = el.selectFirst("span.badge, span.card-ep, div.card-ep")?.text() ?: ""
-                    val epNum = epText.filter { c -> c.isDigit() }.toFloatOrNull()
-                        ?: (episodeEls.size - index).toFloat()
-                    name = el.selectFirst("div.card-title")?.ownText()?.trim()
-                        ?.ifBlank { "Episode ${epNum.toInt()}" }
-                        ?: "Episode ${epNum.toInt()}"
-                    episode_number = epNum
-                }
-            }.sortedByDescending { it.episode_number }
+                    setUrlWithoutDomain("/hentai/${baseSlug}-episode-1")
+                    name = "Episode 1"
+                    episode_number = 1f
+                },
+            )
         }
 
-        // Fallback: synthesise a single episode pointing back to the episode page
-        val seriesSlug = response.request.url.pathSegments.last()
-        val episodeSlug = "$seriesSlug-episode-1"
-        return listOf(
+        return episodes.map { v ->
             SEpisode.create().apply {
-                setUrlWithoutDomain("/hentai/$episodeSlug")
-                name = document.selectFirst("h1.series-title, h1")?.text() ?: "Episode 1"
-                episode_number = 1f
-            },
-        )
+                setUrlWithoutDomain(v.episodeUrlPath)
+                name = v.name
+                episode_number = v.episodeNumber.toFloat()
+                date_upload = v.createdAtUnix * 1000L
+            }
+        }.reversed() // Newest first
     }
 
     // ============================== Video List ============================
@@ -201,65 +268,56 @@ class HentaiTV :
 
     override fun videoListParse(response: Response): List<Video> {
         val document = response.useAsJsoup()
+        val ldJson = document.selectFirst("script[type='application/ld+json']")?.data() ?: ""
 
-        // Primary: nhplayer.com iframes embedded directly in the page
-        val iframeUrls = document.select("iframe[src*='nhplayer.com']")
-            .map { it.attr("src") }
-            .filter { it.isNotBlank() }
-            .distinct()
+        // Collect all nhplayer embed URLs — from JSON-LD first, then iframes as fallback
+        val embedUrls = JSONLD_EMBED_REGEX.findAll(ldJson)
+            .map { it.groupValues[1] }
+            .filter { it.contains("nhplayer.com") }
+            .toMutableList()
 
-        // Fallback: embedUrl inside JSON-LD or RSC data scripts
-        val scriptUrls = if (iframeUrls.isEmpty()) {
-            val scriptData = document.select("script").joinToString(" ") { it.data() }
-            NHP_EMBED_REGEX.findAll(scriptData).map { it.groupValues[1] }.toList()
-        } else {
-            emptyList()
+        if (embedUrls.isEmpty()) {
+            document.select("iframe[src*='nhplayer.com']")
+                .mapTo(embedUrls) { it.attr("abs:src") }
         }
 
-        val allPlayerUrls = (iframeUrls + scriptUrls).distinct()
-
-        require(allPlayerUrls.isNotEmpty()) {
-            "No video sources found on this page. The site may require login for this content."
+        require(embedUrls.isNotEmpty()) {
+            "No video player found on this page. The episode may require a premium account."
         }
 
-        val videos = allPlayerUrls.parallelCatchingFlatMapBlocking { playerUrl ->
+        return embedUrls.distinct().parallelCatchingFlatMapBlocking { playerUrl ->
             extractFromNhPlayer(playerUrl)
         }
-
-        val preferred = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT)!!
-        return videos.sortedWith(compareBy { !it.quality.contains(preferred, ignoreCase = true) })
     }
 
     /**
-     * Fetch an nhplayer.com embed page and extract HLS stream URLs.
-     * The player embeds a video source (m3u8) in its page scripts.
+     * Fetch nhplayer.com embed page and extract HLS m3u8 URLs from its inline scripts.
      */
     private fun extractFromNhPlayer(playerUrl: String): List<Video> {
-        val playerPageHeaders = headers.newBuilder()
+        val nhpHeaders = headers.newBuilder()
             .set("Referer", "$baseUrl/")
             .set("Origin", baseUrl)
             .build()
 
-        val body = client.newCall(GET(playerUrl, playerPageHeaders)).execute()
-            .body.string()
+        val body = client.newCall(GET(playerUrl, nhpHeaders)).execute().body.string()
 
-        val m3u8Urls = M3U8_URL_REGEX.findAll(body)
+        val m3u8Urls = M3U8_REGEX.findAll(body)
             .map { it.groupValues[1] }
             .filter { it.isNotBlank() }
             .distinct()
             .toList()
 
-        val videoHeaders = headers.newBuilder()
+        val hlsHeaders = headers.newBuilder()
             .set("Referer", "https://nhplayer.com/")
             .set("Origin", "https://nhplayer.com")
             .build()
 
-        return m3u8Urls.flatMap { m3u8Url ->
+        return m3u8Urls.flatMap { m3u8 ->
             runCatching {
                 playlistUtils.extractFromHls(
-                    playlistUrl = m3u8Url,
-                    masterHeaders = videoHeaders,
-                    videoHeaders = videoHeaders,
+                    playlistUrl = m3u8,
+                    masterHeaders = hlsHeaders,
+                    videoHeaders = hlsHeaders,
                     videoNameGen = { quality -> "NHPlayer - $quality" },
                 )
             }.getOrDefault(emptyList())
@@ -268,50 +326,45 @@ class HentaiTV :
 
     // ============================== Filters ===============================
 
+    override fun getFilterList(): AnimeFilterList = AnimeFilterList(
+        SortFilter(),
+        AnimeFilter.Separator(),
+        TagFilter(),
+    )
+
     private class SortFilter : UriPartFilter(
         "Sort By",
         arrayOf(
-            Pair("Default", ""),
+            Pair("Latest", "created_at_unix"),
             Pair("Most Viewed", "views"),
-            Pair("Recently Added", "recently_added"),
-            Pair("Top Rated", "top"),
-            Pair("Trending", "trending"),
+            Pair("Top Rated", "likes"),
         ),
     )
 
-    private class GenreFilter : CheckBoxFilterList(
-        "Genres",
+    private class TagFilter : CheckBoxFilterList(
+        "Tags / Genres",
         arrayOf(
             Pair("Ahegao", "ahegao"),
             Pair("Anal", "anal"),
             Pair("BDSM", "bdsm"),
-            Pair("Big Boobs", "big-boobs"),
+            Pair("Big Boobs", "big boobs"),
+            Pair("Blowjob", "blow job"),
             Pair("Censored", "censored"),
             Pair("Cheating", "cheating"),
-            Pair("Comedy", "comedy"),
             Pair("Creampie", "creampie"),
-            Pair("Dark Skin", "dark-skin"),
+            Pair("Dark Skin", "dark skin"),
             Pair("Fantasy", "fantasy"),
-            Pair("Gender Bender", "gender-bender"),
             Pair("Group", "group"),
             Pair("Harem", "harem"),
             Pair("Horror", "horror"),
             Pair("Housewife", "housewife"),
             Pair("Incest", "incest"),
-            Pair("Lactation", "lactation"),
-            Pair("Masturbation", "masturbation"),
-            Pair("Milf", "milf"),
-            Pair("Mind Break", "mind-break"),
+            Pair("Mind Break", "mind break"),
             Pair("Monster", "monster"),
-            Pair("Netorare", "netorare"),
+            Pair("Netorare", "ntr"),
             Pair("Nurse", "nurse"),
-            Pair("Outdoor", "outdoor"),
-            Pair("School Girl", "school-girl"),
-            Pair("Shotacon", "shotacon"),
-            Pair("Succubus", "succubus"),
+            Pair("School Girl", "school girl"),
             Pair("Tentacle", "tentacle"),
-            Pair("Threesome", "threesome"),
-            Pair("Toys", "toys"),
             Pair("Uncensored", "uncensored"),
             Pair("Virgin", "virgin"),
             Pair("Yaoi", "yaoi"),
@@ -319,20 +372,11 @@ class HentaiTV :
         ),
     )
 
-    override fun getFilterList(): AnimeFilterList = AnimeFilterList(
-        SortFilter(),
-        AnimeFilter.Separator(),
-        GenreFilter(),
-    )
-
-    // ========================== Filter helpers ============================
-
     private open class UriPartFilter(
         displayName: String,
         private val vals: Array<Pair<String, String>>,
     ) : AnimeFilter.Select<String>(displayName, vals.map { it.first }.toTypedArray()) {
         fun toUriPart() = vals[state].second
-        fun isDefault() = state == 0
     }
 
     private class CheckBoxVal(name: String) : AnimeFilter.CheckBox(name, false)
@@ -366,12 +410,24 @@ class HentaiTV :
     // =============================== Regex ================================
 
     companion object {
-        /** Matches nhplayer.com embed URLs in JSON-LD / RSC script data. */
-        private val NHP_EMBED_REGEX =
-            Regex(""""embedUrl"\s*:\s*"(https://nhplayer\.com/v/[^"]+)"""")
+        /** Extracts embedUrl from JSON-LD (nhplayer embed URL) */
+        private val JSONLD_EMBED_REGEX =
+            Regex(""""embedUrl"\s*:\s*"([^"]+)"""")
 
-        /** Matches m3u8 stream URLs inside nhplayer page scripts. */
-        private val M3U8_URL_REGEX =
+        /** First "name" in JSON-LD = VideoObject name */
+        private val JSONLD_NAME_REGEX =
+            Regex(""""name"\s*:\s*"([^"]+)"""")
+
+        /** Description in JSON-LD */
+        private val JSONLD_DESC_REGEX =
+            Regex(""""description"\s*:\s*"((?:[^"\\]|\\.)*)"""")
+
+        /** First thumbnail URL from thumbnailUrl array in JSON-LD */
+        private val JSONLD_THUMB_REGEX =
+            Regex(""""thumbnailUrl"\s*:\s*\[\s*"([^"]+)"""")
+
+        /** m3u8 stream URL inside nhplayer page scripts */
+        private val M3U8_REGEX =
             Regex("""["'](https?://[^"'\s\\]+\.m3u8[^"'\s\\]*)["']""")
 
         private const val PREF_QUALITY_KEY = "preferred_quality"
