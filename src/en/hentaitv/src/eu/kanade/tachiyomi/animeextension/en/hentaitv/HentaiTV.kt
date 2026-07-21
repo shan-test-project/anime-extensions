@@ -190,7 +190,8 @@ class HentaiTV :
             // Description from JSON-LD (full and clean)
             description = JSONLD_DESC_REGEX.find(ldJson)?.groupValues?.get(1)
                 ?.replace(Regex("<[^>]+>"), "")
-                ?.replace("\\u003c", "<").replace("\\u003e", ">")
+                ?.replace("\\u003c", "<")
+                ?.replace("\\u003e", ">")
                 ?.replace(Regex("\\\\[rn]"), "\n")
                 ?.trim()
 
