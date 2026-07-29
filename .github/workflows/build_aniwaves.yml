@@ -1,0 +1,55 @@
+name: Build AniWaves APK
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'src/en/aniwaves/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build AniWaves APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Generate debug signing key
+        run: |
+          keytool -genkeypair -v \
+            -keystore signingkey.jks \
+            -alias key0 \
+            -keyalg RSA -keysize 2048 \
+            -validity 10000 \
+            -storepass android \
+            -keypass android \
+            -dname "CN=aniwaves, OU=Extensions, O=aniwaves, L=Unknown, ST=Unknown, C=US"
+          echo "KEY_STORE_PASSWORD=android" >> $GITHUB_ENV
+          echo "ALIAS=key0"               >> $GITHUB_ENV
+          echo "KEY_PASSWORD=android"     >> $GITHUB_ENV
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build AniWaves APK
+        run: ./gradlew :src:en:aniwaves:assembleRelease -x spotlessCheck
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: aniwaves-APK
+          path: src/en/aniwaves/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
