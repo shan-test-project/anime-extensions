@@ -1,13 +1,11 @@
 ext {
     extName = 'AniWaves'
     extClass = '.AniWaves'
-    themePkg = 'zorotheme'
-    baseUrl = 'https://aniwaves.ru'
-    overrideVersionCode = 1
+    extVersionCode = 2
 }
 
 apply plugin: "kei.plugins.extension.legacy"
 
 dependencies {
-    implementation(project(":lib:megacloudextractor"))
+    implementation(project(":lib:playlistutils"))
 }
