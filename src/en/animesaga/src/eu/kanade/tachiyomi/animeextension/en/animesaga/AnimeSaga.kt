@@ -839,6 +839,11 @@ class LocalProxy(private val client: OkHttpClient) {
         } catch (e: Exception) {}
     }
 
+    fun shutdown() {
+        try { serverSocket?.close() } catch (_: Exception) {}
+        executor.shutdownNow()
+    }
+
     fun getProxyUrl(targetUrl: String, headers: Headers?): String {
         val encodedUrl = Base64.encodeToString(targetUrl.toByteArray(), Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
         val headersStr = headers?.let { h ->
@@ -958,9 +963,28 @@ class LocalProxy(private val client: OkHttpClient) {
             out.write("Content-Type: video/mp2t\r\n".toByteArray())
             out.write("Connection: close\r\n\r\n".toByteArray())
 
-            val rawBytes = response.body.bytes()
-            val stripped = stripPngHeader(rawBytes)
-            out.write(stripped)
+            // Peek at the first 8 bytes to detect PNG-wrapped TS without loading the full body
+            val source = response.body.source()
+            source.request(8L)
+            val isPng = source.buffer.size >= 8 &&
+                source.buffer[0] == (-119).toByte() &&
+                source.buffer[1] == 80.toByte() &&
+                source.buffer[2] == 78.toByte() &&
+                source.buffer[3] == 71.toByte()
+            if (isPng) {
+                // PNG-wrapped TS: load fully to scan for IEND marker and TS sync bytes
+                val rawBytes = source.readByteArray()
+                val stripped = stripPngHeader(rawBytes)
+                out.write(stripped)
+            } else {
+                // Plain TS segment: stream in 8 KB chunks to avoid loading large segments into memory
+                val buf = ByteArray(8192)
+                val inputStream = source.inputStream()
+                var bytesRead: Int
+                while (inputStream.read(buf).also { bytesRead = it } != -1) {
+                    out.write(buf, 0, bytesRead)
+                }
+            }
         }
         out.flush()
     }
