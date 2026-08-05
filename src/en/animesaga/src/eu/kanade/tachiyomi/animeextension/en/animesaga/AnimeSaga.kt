@@ -625,6 +625,16 @@ class AnimeSaga :
         }
         screen.addPreference(audioPref)
 
+        val qualityPref = ListPreference(screen.context).apply {
+            key = PREF_QUALITY_KEY
+            title = "Preferred Quality"
+            entries = arrayOf("1080p", "720p", "480p", "360p")
+            entryValues = arrayOf("1080", "720", "480", "360")
+            setDefaultValue("1080")
+            summary = "%s"
+        }
+        screen.addPreference(qualityPref)
+
         val excludeServersPref = MultiSelectListPreference(screen.context).apply {
             key = PREF_EXCLUDE_SERVERS_KEY
             title = "Exclude Servers"
