@@ -1,6 +1,5 @@
 package eu.kanade.tachiyomi.animeextension.en.animesaga
 
-import android.app.Application
 import android.content.SharedPreferences
 import android.net.Uri
 import android.util.Base64
@@ -15,12 +14,13 @@ import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
+import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import aniyomi.lib.doodextractor.DoodExtractor
 import aniyomi.lib.playlistutils.PlaylistUtils
 import aniyomi.lib.vidhideextractor.VidHideExtractor
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
-import keiyoushi.utils.Source
+import keiyoushi.utils.getPreferencesLazy
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -31,7 +31,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.net.ServerSocket
 import java.net.Socket
@@ -41,7 +40,7 @@ import java.util.concurrent.Executors
 import kotlin.math.min
 
 class AnimeSaga :
-    Source(),
+    AnimeHttpSource(),
     ConfigurableAnimeSource {
 
     override val name = "AnimeSaga"
@@ -51,6 +50,8 @@ class AnimeSaga :
     override val lang = "en"
 
     override val supportsLatest = true
+
+    val preferences: SharedPreferences by getPreferencesLazy()
 
     private val playlistUtils by lazy { PlaylistUtils(client, headers) }
 
@@ -441,11 +442,14 @@ class AnimeSaga :
         }
 
         val prefServer = preferences.getString(PREF_SERVER_KEY, "auto") ?: "auto"
-        return if (prefServer == "auto") {
-            videoList
-        } else {
-            videoList.sortedByDescending { it.quality.contains(prefServer, ignoreCase = true) }
-        }
+        val prefAudio = preferences.getString(PREF_AUDIO_KEY, "SUB") ?: "SUB"
+        val prefQuality = preferences.getString(PREF_QUALITY_KEY, "1080") ?: "1080"
+        return videoList.sortedWith(
+            compareByDescending<Video> { prefServer != "auto" && it.quality.contains(prefServer, ignoreCase = true) }
+                .thenByDescending { it.quality.contains(prefAudio, ignoreCase = true) }
+                .thenByDescending { it.quality.contains(prefQuality, ignoreCase = true) }
+                .thenByDescending { it.quality.contains("HD-1", ignoreCase = true) },
+        )
     }
 
     private suspend fun extractVideos(
@@ -507,8 +511,9 @@ class AnimeSaga :
                     extractor.videosFromUrl(embedUrl) { quality -> "$audioType - $quality" }.forEach { v ->
                         videoList.add(
                             Video(
+                                url = v.url,
+                                quality = v.quality,
                                 videoUrl = v.videoUrl,
-                                videoTitle = v.videoTitle,
                                 headers = v.headers,
                                 subtitleTracks = v.subtitleTracks + subtitleTracks,
                             ),
@@ -521,8 +526,9 @@ class AnimeSaga :
                     extractor.videosFromUrl(embedUrl, quality = audioType).forEach { v ->
                         videoList.add(
                             Video(
+                                url = v.url,
+                                quality = v.quality,
                                 videoUrl = v.videoUrl,
-                                videoTitle = v.videoTitle,
                                 headers = v.headers,
                                 subtitleTracks = v.subtitleTracks + subtitleTracks,
                             ),
@@ -569,16 +575,6 @@ class AnimeSaga :
         }
 
         return videoList
-    }
-
-    override fun List<Video>.sortVideos(): List<Video> {
-        val prefAudio = preferences.getString(PREF_AUDIO_KEY, "SUB") ?: "SUB"
-        val prefQuality = preferences.getString(PREF_QUALITY_KEY, "1080") ?: "1080"
-        return sortedWith(
-            compareByDescending<Video> { it.videoTitle.contains(prefAudio, ignoreCase = true) }
-                .thenByDescending { it.videoTitle.contains(prefQuality, ignoreCase = true) }
-                .thenByDescending { it.videoTitle.contains("HD-1", ignoreCase = true) },
-        )
     }
 
     // ============================== Settings ==============================
@@ -1176,3 +1172,4 @@ data class EpisodePayload(
     val anilistId: Int,
     val malId: Int?,
 )
+
