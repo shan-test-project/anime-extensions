@@ -57,12 +57,22 @@ class AnimeSaga :
 
     private val localProxy by lazy { LocalProxy(client) }
 
-    override val json: Json by lazy {
+    val json: Json by lazy {
         Json {
             ignoreUnknownKeys = true
             coerceInputValues = true
         }
     }
+
+
+    // ============================== Required Abstract Stubs ==============================
+    // AnimeSaga overrides the suspend functions directly, so these are never called
+    override fun animeDetailsRequest(anime: SAnime) = throw UnsupportedOperationException()
+    override fun animeDetailsParse(response: Response): SAnime = throw UnsupportedOperationException()
+    override fun episodeListRequest(anime: SAnime) = throw UnsupportedOperationException()
+    override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()
+    override fun videoListRequest(episode: SEpisode) = throw UnsupportedOperationException()
+    override fun videoListParse(response: Response): List<Video> = throw UnsupportedOperationException()
 
     override fun headersBuilder() = super.headersBuilder()
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
