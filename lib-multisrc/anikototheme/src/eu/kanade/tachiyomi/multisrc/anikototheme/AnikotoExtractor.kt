@@ -367,19 +367,19 @@ class AnikotoExtractor(private val theme: AnikotoTheme) {
 
     private suspend fun proxyVideoList(videos: List<Video>): List<Video> {
         if (!theme.m3u8ServerManager.isRunning()) {
-            Log.e("AnikotoExtractor", "M3U8 server not running, dropping ${videos.size} videos")
-            return emptyList()
+            Log.w("AnikotoExtractor", "M3U8 server not running, falling back to unproxied videos")
+            return videos
         }
-        return videos.mapNotNull { video ->
+        return videos.map { video ->
             val processedUrl = proxyThroughM3u8Server(video.url)
             if (processedUrl == null) {
-                Log.w("AnikotoExtractor", "Proxy failed for: ${video.quality}")
-            }
-            processedUrl?.let {
+                Log.w("AnikotoExtractor", "Proxy failed for: ${video.quality}, using original URL")
+                video
+            } else {
                 Video(
-                    url = it,
+                    url = processedUrl,
                     quality = video.quality,
-                    videoUrl = it,
+                    videoUrl = processedUrl,
                     headers = video.headers,
                     subtitleTracks = video.subtitleTracks,
                     audioTracks = video.audioTracks,
