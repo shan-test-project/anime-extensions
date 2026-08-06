@@ -248,8 +248,14 @@ class AnikotoExtractor(private val theme: AnikotoTheme) {
         apiHeaders: Headers,
         streamType: String,
     ): Pair<SourceResponseDto, Boolean> {
+        // Primary endpoint: single id param + type param (matches site API expectation)
+        val primaryUrl = if (streamType.isNotEmpty()) {
+            "https://$host/stream/getSources?id=$dataId&type=$streamType"
+        } else {
+            "https://$host/stream/getSources?id=$dataId"
+        }
         val primaryResult = try {
-            val data = theme.client.newCall(GET("https://$host/stream/getSources?id=$dataId&id=$dataId", apiHeaders))
+            val data = theme.client.newCall(GET(primaryUrl, apiHeaders))
                 .awaitSuccess().use { response ->
                     if (!response.isSuccessful) throw Exception("getSources failed: HTTP ${response.code}")
                     response.parseAs<SourceResponseDto>()
@@ -261,10 +267,11 @@ class AnikotoExtractor(private val theme: AnikotoTheme) {
 
         if (primaryResult != null) return primaryResult
 
+        // Fallback endpoint
         val newUrl = if (streamType.isNotEmpty()) {
-            "https://$host/stream/getSourcesNew?id=$dataId&id=$dataId&type=$streamType&type=$streamType"
+            "https://$host/stream/getSourcesNew?id=$dataId&type=$streamType"
         } else {
-            "https://$host/stream/getSourcesNew?id=$dataId&id=$dataId"
+            "https://$host/stream/getSourcesNew?id=$dataId"
         }
 
         val data = theme.client.newCall(GET(newUrl, apiHeaders))
@@ -273,7 +280,11 @@ class AnikotoExtractor(private val theme: AnikotoTheme) {
                 response.parseAs<SourceResponseDto>()
             }
 
-        return data to true
+        // Return false: do not proxy — direct URLs work and the proxy does not forward
+        // the correct per-server Referer/Origin headers when fetching segments, which
+        // causes CDNs to serve segments without a recognized Content-Type and MPV/ExoPlayer
+        // cannot detect the MPEG-TS container (black screen with visible duration).
+        return data to false
     }
 
     private suspend fun fetchSourcesFromPage(

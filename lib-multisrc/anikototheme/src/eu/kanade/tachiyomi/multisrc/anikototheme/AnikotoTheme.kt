@@ -148,9 +148,11 @@ abstract class AnikotoTheme(
     }
 
     internal open fun alwaysNeedsProxy(serverName: String): Boolean {
-        val name = serverName.lowercase()
-        if (name.contains("kiwi")) return true
-        if (name.contains("vidplay")) return true
+        // Proxy disabled: m3u8ServerManager does not forward the correct per-server
+        // Referer/Origin headers when fetching HLS segments from the CDN. This causes
+        // CDNs to return segments without a recognised Content-Type, leading to a black
+        // screen in MPV/ExoPlayer even though duration is detected (MPEG-TS container
+        // detection failure). Direct URLs with correct video headers work fine.
         return false
     }
 
