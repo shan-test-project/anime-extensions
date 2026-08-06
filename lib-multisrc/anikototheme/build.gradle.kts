@@ -4,9 +4,8 @@ plugins {
     alias(kei.plugins.multisrc)
 }
 
-baseVersionCode = 1
+baseVersionCode = 2
 
 dependencies {
     implementation(project(":lib:playlistutils"))
-    implementation(project(":lib:m3u8server"))
 }
