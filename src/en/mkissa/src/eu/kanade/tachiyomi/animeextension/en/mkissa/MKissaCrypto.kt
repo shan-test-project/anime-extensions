@@ -32,8 +32,8 @@ object MKissaCrypto {
 
     private const val WINDOW_MS = 5 * 60 * 1000L
 
-    // The server derives partB from a 3-day epoch and keeps the previous alive for a day.
-    private const val EPOCH_WINDOW_MS = 3 * 24 * 60 * 60 * 1000L
+    // The server derives partB from a 7-day epoch and keeps the previous alive for a day.
+    private const val EPOCH_WINDOW_MS = 7 * 24 * 60 * 60 * 1000L
     private const val EPOCH_GRACE_MS = 24 * 60 * 60 * 1000L
 
     /** `seeds XOR f(buildId) XOR f(position)`; both inputs change on every site rebuild. */
