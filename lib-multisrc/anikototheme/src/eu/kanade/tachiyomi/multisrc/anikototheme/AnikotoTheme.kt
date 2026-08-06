@@ -6,7 +6,6 @@ import android.util.Log
 import androidx.preference.ListPreference
 import androidx.preference.MultiSelectListPreference
 import androidx.preference.PreferenceScreen
-import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -31,14 +30,9 @@ import keiyoushi.utils.useAsJsoup
 import okhttp3.CacheControl
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Interceptor
-import okhttp3.MediaType
 import okhttp3.OkHttpClient
-import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
-import okhttp3.ResponseBody
-import okio.BufferedSource
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.math.BigDecimal
@@ -97,64 +91,10 @@ abstract class AnikotoTheme(
     internal val playlistClient by lazy {
         client.newBuilder()
             .readTimeout(30, TimeUnit.SECONDS)
-            .protocols(listOf(Protocol.HTTP_1_1))
             .build()
     }
 
     internal val playlistUtils by lazy { PlaylistUtils(playlistClient, headers) }
-
-    internal val m3u8Client by lazy {
-        client.newBuilder()
-            .readTimeout(30, TimeUnit.SECONDS)
-            .protocols(listOf(Protocol.HTTP_1_1))
-            .addInterceptor(JunkBytesInterceptor())
-            .build()
-    }
-
-    internal val m3u8ServerManager by lazy { M3u8ServerManager(m3u8Client) }
-
-    private class JunkBytesInterceptor : Interceptor {
-        override fun intercept(chain: Interceptor.Chain): Response {
-            val request = chain.request()
-            val response = chain.proceed(request)
-
-            if (!JUNK_URL_REGEX.containsMatchIn(request.url.toString())) return response
-
-            val body = response.body
-            val originalLength = body.contentLength()
-            if (originalLength != -1L && originalLength <= STRIP_BYTES) return response
-
-            val source = body.source()
-            try {
-                source.skip(STRIP_BYTES.toLong())
-            } catch (_: Exception) {
-                return response
-            }
-
-            val newBody = object : ResponseBody() {
-                override fun contentType(): MediaType? = body.contentType()
-                override fun contentLength(): Long = if (originalLength == -1L) -1L else (originalLength - STRIP_BYTES)
-                override fun source(): BufferedSource = source
-            }
-
-            return response.newBuilder().body(newBody).build()
-        }
-
-        companion object {
-            private const val STRIP_BYTES = 252
-            private val JUNK_URL_REGEX =
-                Regex("ibyteimg\\.com|tiktokcdn\\.com", RegexOption.IGNORE_CASE)
-        }
-    }
-
-    internal open fun alwaysNeedsProxy(serverName: String): Boolean {
-        // Proxy disabled: m3u8ServerManager does not forward the correct per-server
-        // Referer/Origin headers when fetching HLS segments from the CDN. This causes
-        // CDNs to return segments without a recognised Content-Type, leading to a black
-        // screen in MPV/ExoPlayer even though duration is detected (MPEG-TS container
-        // detection failure). Direct URLs with correct video headers work fine.
-        return false
-    }
 
     private val extractors by lazy { AnikotoExtractor(this) }
 
@@ -595,22 +535,7 @@ abstract class AnikotoTheme(
             return emptyList()
         }
 
-        ensureM3u8ServerRunning()
-
         return extractors.extractVideos(document, episode, epUrl)
-    }
-
-    private suspend fun ensureM3u8ServerRunning() {
-        if (m3u8ServerManager.isRunning()) return
-        try {
-            m3u8ServerManager.startServer()
-            val deadline = System.currentTimeMillis() + 2000L
-            while (!m3u8ServerManager.isRunning() && System.currentTimeMillis() < deadline) {
-                kotlinx.coroutines.delay(50L)
-            }
-        } catch (e: Exception) {
-            Log.e("AnikotoTheme", "M3U8 server start failed: ${e.message}")
-        }
     }
 
     override fun videoListSelector() = throw UnsupportedOperationException()
