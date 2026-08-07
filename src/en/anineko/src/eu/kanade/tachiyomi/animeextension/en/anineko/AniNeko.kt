@@ -206,6 +206,7 @@ class AniNeko :
             val iframeUrl = button.attr("data-video")
             if (iframeUrl.isBlank()) return@parallelCatchingFlatMapBlocking emptyList<Video>()
 
+            val serverName = button.ownText().trim()
             val rawType = button.selectFirst("span")?.text() ?: ""
             val versionType = when {
                 rawType.contains("Sort Sub", ignoreCase = true) -> "Soft Sub"
@@ -241,7 +242,7 @@ class AniNeko :
                         playlistUtils.extractFromHls(
                             finalM3u8,
                             referer = iframeUrl,
-                            videoNameGen = { quality -> "$versionType - $quality" },
+                            videoNameGen = { quality -> "$serverName - $versionType - $quality" },
                             subtitleList = subtitleTracks,
                         )
                     } else {
@@ -254,7 +255,7 @@ class AniNeko :
                     extractor.videosFromUrl(iframeUrl) { quality -> "$versionType - $quality" }.map { video ->
                         Video(
                             url = video.url,
-                            quality = video.quality,
+                            quality = addServerName(serverName, video.quality),
                             videoUrl = video.videoUrl,
                             headers = video.headers,
                             subtitleTracks = video.subtitleTracks + subtitleTracks,
@@ -267,7 +268,7 @@ class AniNeko :
                     extractor.videosFromUrl(iframeUrl, quality = versionType).map { video ->
                         Video(
                             url = video.url,
-                            quality = video.quality,
+                            quality = addServerName(serverName, video.quality),
                             videoUrl = video.videoUrl,
                             headers = video.headers,
                             subtitleTracks = video.subtitleTracks + subtitleTracks,
@@ -300,6 +301,13 @@ class AniNeko :
                 ),
             )
     }
+
+    private fun addServerName(serverName: String, quality: String): String =
+        if (serverName.isBlank() || quality.startsWith("$serverName - ", ignoreCase = true)) {
+            quality
+        } else {
+            "$serverName - $quality"
+        }
 
     // ============================== Preferences ==============================
 
@@ -592,6 +600,7 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
                 }
             }
 
+            var clientRange: String? = null
             var line: String?
             while (reader.readLine().also { line = it } != null) {
                 if (line!!.isEmpty()) break
@@ -600,7 +609,10 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
                     val name = headerParts[0].trim()
                     val value = headerParts[1].trim()
                     if (name.equals("Range", ignoreCase = true) && !isM3u8Request) {
-                        targetHeaders.set(name, value)
+                        // HD-1 wraps the MPEG-TS payload in a PNG response. The
+                        // player range is relative to the unwrapped payload, so
+                        // it must be applied after the wrapper is removed.
+                        clientRange = value
                     }
                 }
             }
@@ -612,7 +624,7 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
 
             requestParsed = true
             client.newCall(request).execute().use { response ->
-                sendResponse(socket, response, targetUrl, encodedHeaders)
+                sendResponse(socket, response, targetUrl, encodedHeaders, clientRange)
             }
         } catch (e: Exception) {
             // Only attempt to send an HTTP error response when the request was
@@ -631,19 +643,54 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
         }
     }
 
-    private fun sendResponse(socket: Socket, response: Response, targetUrl: String, encodedHeaders: String) {
+    private fun sendResponse(
+        socket: Socket,
+        response: Response,
+        targetUrl: String,
+        encodedHeaders: String,
+        clientRange: String?,
+    ) {
         val out = socket.getOutputStream()
         val isM3u8 = targetUrl.contains(".m3u8") || response.header("Content-Type")?.contains("mpegurl") == true
 
-        var modifiedContentBytes: ByteArray? = null
         if (isM3u8) {
             val bodyString = response.body.string()
             val modifiedContent = processM3u8(bodyString, targetUrl, encodedHeaders)
-            modifiedContentBytes = modifiedContent.toByteArray()
+            val body = modifiedContent.toByteArray()
+            out.write("HTTP/1.1 ${response.code} ${response.message}\r\n".toByteArray())
+            writeForwardedHeaders(out, response, isM3u8 = true)
+            out.write("Content-Length: ${body.size}\r\n".toByteArray())
+            out.write("Content-Type: application/vnd.apple.mpegurl\r\n".toByteArray())
+            out.write("Connection: close\r\n\r\n".toByteArray())
+            out.write(body)
+            out.flush()
+            return
         }
 
-        out.write("HTTP/1.1 ${response.code} ${response.message}\r\n".toByteArray())
+        val rawBytes = response.body.bytes()
+        val stripped = stripPngHeader(rawBytes)
+        val range = parseRange(clientRange, stripped.size)
+        val body = range?.let { stripped.copyOfRange(it.first, it.last + 1) } ?: stripped
+        val status = if (range == null) 200 else 206
 
+        out.write("HTTP/1.1 $status ${if (status == 206) "Partial Content" else "OK"}\r\n".toByteArray())
+        writeForwardedHeaders(out, response, isM3u8 = false)
+        if (range != null) {
+            out.write("Accept-Ranges: bytes\r\n".toByteArray())
+            out.write("Content-Range: bytes ${range.first}-${range.last}/${stripped.size}\r\n".toByteArray())
+        }
+        out.write("Content-Length: ${body.size}\r\n".toByteArray())
+        out.write("Content-Type: video/mp2t\r\n".toByteArray())
+        out.write("Connection: close\r\n\r\n".toByteArray())
+        out.write(body)
+        out.flush()
+    }
+
+    private fun writeForwardedHeaders(
+        out: java.io.OutputStream,
+        response: Response,
+        isM3u8: Boolean,
+    ) {
         val headers = response.headers
         for (i in 0 until headers.size) {
             val name = headers.name(i)
@@ -651,27 +698,34 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
             if (name.equals("Connection", ignoreCase = true) ||
                 name.equals("Transfer-Encoding", ignoreCase = true) ||
                 name.equals("Content-Type", ignoreCase = true) ||
-                (name.equals("Content-Length", ignoreCase = true) && isM3u8)
+                name.equals("Content-Length", ignoreCase = true) ||
+                (!isM3u8 && name.equals("Content-Range", ignoreCase = true)) ||
+                (!isM3u8 && name.equals("Accept-Ranges", ignoreCase = true))
             ) {
                 continue
             }
             out.write("$name: $value\r\n".toByteArray())
         }
+    }
 
-        if (isM3u8 && modifiedContentBytes != null) {
-            out.write("Content-Length: ${modifiedContentBytes.size}\r\n".toByteArray())
-            out.write("Content-Type: application/vnd.apple.mpegurl\r\n".toByteArray())
-            out.write("Connection: close\r\n\r\n".toByteArray())
-            out.write(modifiedContentBytes)
-        } else {
-            out.write("Content-Type: video/mp2t\r\n".toByteArray())
-            out.write("Connection: close\r\n\r\n".toByteArray())
+    private fun parseRange(rangeHeader: String?, size: Int): IntRange? {
+        if (rangeHeader.isNullOrBlank() || size <= 0 || !rangeHeader.startsWith("bytes=")) return null
 
-            val rawBytes = response.body.bytes()
-            val stripped = stripPngHeader(rawBytes)
-            out.write(stripped)
+        val range = rangeHeader.removePrefix("bytes=").substringBefore(",")
+        val parts = range.split("-", limit = 2)
+        if (parts.size != 2) return null
+
+        val start = parts[0].toIntOrNull()
+        val end = parts[1].toIntOrNull()
+        return when {
+            start != null && start >= 0 && start < size -> {
+                start..min(end ?: (size - 1), size - 1)
+            }
+            start == null && end != null && end > 0 -> {
+                maxOf(0, size - end)..(size - 1)
+            }
+            else -> null
         }
-        out.flush()
     }
 
     private fun processM3u8(content: String, playlistUrl: String, encodedHeaders: String): String {
