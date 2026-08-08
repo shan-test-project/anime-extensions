@@ -305,8 +305,8 @@ class AniNeko :
             }
         }
 
-        val excludedServers = preferences.getStringSet(EXCLUDE_SERVERS_KEY, emptySet()) ?: emptySet()
-        val excludedAudios = preferences.getStringSet(EXCLUDE_AUDIO_KEY, emptySet()) ?: emptySet()
+        val excludedServers = preferences.getStringSet(EXCLUDE_SERVERS_KEY, emptySet())!!
+        val excludedAudios = preferences.getStringSet(EXCLUDE_AUDIO_KEY, emptySet())!!
 
         val preferredQuality = preferences.getString(QUALITY_KEY, QUALITY_DEFAULT)!!
         val preferredAudioType = preferences.getString(TYPE_KEY, TYPE_DEFAULT)!!
@@ -431,7 +431,6 @@ class AniNeko :
         val HOST_ENTRIES = listOf("HD-1", "HD-2", "StreamHG", "Earnvids", "Doodstream")
 
         const val EXCLUDE_SERVERS_KEY = "exclude_servers"
-
         const val EXCLUDE_AUDIO_KEY = "exclude_audio"
 
         const val TITLE_LANG_KEY = "preferred_title_lang"
