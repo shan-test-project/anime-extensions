@@ -3,6 +3,9 @@ package eu.kanade.tachiyomi.animeextension.en.anineko
 import android.net.Uri
 import android.util.Base64
 import androidx.preference.PreferenceScreen
+import aniyomi.lib.doodextractor.DoodExtractor
+import aniyomi.lib.playlistutils.PlaylistUtils
+import aniyomi.lib.vidhideextractor.VidHideExtractor
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -12,13 +15,9 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
-import aniyomi.lib.doodextractor.DoodExtractor
-import aniyomi.lib.playlistutils.PlaylistUtils
-import aniyomi.lib.vidhideextractor.VidHideExtractor
 import eu.kanade.tachiyomi.network.GET
 import keiyoushi.utils.addListPreference
 import keiyoushi.utils.addSetPreference
-import keiyoushi.utils.addSwitchPreference
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parallelCatchingFlatMapBlocking
 import keiyoushi.utils.useAsJsoup
@@ -344,12 +343,11 @@ class AniNeko :
         return VideoInfo(videoQuality, audioType, bandwidth)
     }
 
-    private fun addServerName(serverName: String, quality: String): String =
-        if (serverName.isBlank() || quality.startsWith("$serverName - ", ignoreCase = true)) {
-            quality
-        } else {
-            "$serverName - $quality"
-        }
+    private fun addServerName(serverName: String, quality: String): String = if (serverName.isBlank() || quality.startsWith("$serverName - ", ignoreCase = true)) {
+        quality
+    } else {
+        "$serverName - $quality"
+    }
 
     // ============================== Preferences ==============================
 
@@ -571,7 +569,9 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
 
     /** Stop accepting new connections and release all resources. */
     fun shutdown() {
-        try { serverSocket?.close() } catch (_: Exception) {}
+        try {
+            serverSocket?.close()
+        } catch (_: Exception) {}
         executor.shutdownNow()
     }
 
