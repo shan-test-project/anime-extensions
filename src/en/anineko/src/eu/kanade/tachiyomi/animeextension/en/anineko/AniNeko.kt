@@ -185,6 +185,7 @@ class AniNeko :
     override fun episodeListParse(response: Response): List<SEpisode> {
         val document = response.useAsJsoup()
         val episodes = document.select("div.nv-info-episode-grid article.nv-info-episode-item")
+        val showThumbnails = preferences.getBoolean(PREF_SHOW_THUMBNAILS_KEY, true)
 
         val list = episodes.map { element ->
             SEpisode.create().apply {
@@ -193,6 +194,9 @@ class AniNeko :
 
                 val titleEl = linkEl.selectFirst("strong")
                 name = titleEl?.text() ?: linkEl.text()
+                if (showThumbnails) {
+                    thumbnail_url = linkEl.selectFirst("img")?.attr("src")
+                }
 
                 episode_number = name.substringAfter("Episode").trim().toFloatOrNull() ?: 1.0f
             }
@@ -549,12 +553,14 @@ class AniNeko :
 
 class LocalProxy(private val client: okhttp3.OkHttpClient) {
     private var serverSocket: ServerSocket? = null
-    private val executor = Executors.newCachedThreadPool()
+    private val executor = Executors.newFixedThreadPool(
+        maxOf(2, Runtime.getRuntime().availableProcessors() * 2),
+    )
     var port: Int = 0
         private set
 
     /** True only when the local proxy server started successfully. */
-    val isAvailable: Boolean get() = port > 0
+    val isAvailable: Boolean get() = port > 0 && serverSocket?.isClosed == false
 
     init {
         try {
@@ -565,6 +571,7 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
                 while (!ss.isClosed) {
                     try {
                         val socket = ss.accept()
+                        socket.soTimeout = 30_000
                         executor.execute { handleSocket(socket) }
                     } catch (_: Exception) {}
                 }
@@ -713,11 +720,15 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
             return
         }
 
-        val rawBytes = response.body.bytes()
-        val stripped = stripPngHeader(rawBytes)
+        val stripped = stripPngHeader(response.body.bytes())
         val range = parseRange(clientRange, stripped.size)
         val body = range?.let { stripped.copyOfRange(it.first, it.last + 1) } ?: stripped
         val status = if (range == null) 200 else 206
+        val contentType = if (isMpegTs(stripped)) {
+            "video/mp2t"
+        } else {
+            response.header("Content-Type") ?: "application/octet-stream"
+        }
 
         out.write("HTTP/1.1 $status ${if (status == 206) "Partial Content" else "OK"}\r\n".toByteArray())
         writeForwardedHeaders(out, response, isM3u8 = false)
@@ -726,7 +737,7 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
             out.write("Content-Range: bytes ${range.first}-${range.last}/${stripped.size}\r\n".toByteArray())
         }
         out.write("Content-Length: ${body.size}\r\n".toByteArray())
-        out.write("Content-Type: video/mp2t\r\n".toByteArray())
+        out.write("Content-Type: $contentType\r\n".toByteArray())
         out.write("Connection: close\r\n\r\n".toByteArray())
         out.write(body)
         out.flush()
@@ -840,6 +851,16 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
             }
         }
         return tsData
+    }
+
+    private fun isMpegTs(data: ByteArray): Boolean {
+        if (data.size < 376) return false
+        val maxOffset = min(data.size - 376, 400)
+        return (0..maxOffset).any { offset ->
+            data[offset] == 0x47.toByte() &&
+                data[offset + 188] == 0x47.toByte() &&
+                data[offset + 376] == 0x47.toByte()
+        }
     }
 
     private fun sendError(socket: Socket, code: Int, message: String) {
