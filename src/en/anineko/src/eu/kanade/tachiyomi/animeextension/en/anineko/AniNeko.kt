@@ -37,7 +37,6 @@ class AniNeko :
     private data class VideoInfo(
         val quality: String?,
         val audioType: String?,
-        val host: String?,
         val bandwidth: Long?,
     )
 
@@ -318,13 +317,11 @@ class AniNeko :
                     { (_, info) ->
                         if (info.audioType?.equals(preferredAudioType, ignoreCase = true) == true) 0 else 1
                     },
+                    { (video, _) -> if (video.quality.startsWith("$preferredHost - ", ignoreCase = true)) 0 else 1 },
                     { (_, info) ->
                         qualityOrder.indexOf(info.quality).let { if (it == -1) Int.MAX_VALUE else it }
                     },
                     { (_, info) -> -(info.bandwidth ?: -1L) },
-                    { (_, info) ->
-                        if (info.host?.equals(preferredHost, ignoreCase = true) == true) 0 else 1
-                    },
                     { (video, _) -> video.quality },
                 ),
             )
@@ -334,7 +331,6 @@ class AniNeko :
     private fun parseVideoInfo(quality: String): VideoInfo {
         val videoQuality = qualityRegex.find(quality)?.value?.lowercase()
         val audioType = audioTypes.firstOrNull { quality.contains(it, ignoreCase = true) }
-        val host = hosts.firstOrNull { quality.startsWith("$it - ", ignoreCase = true) }
         val bandwidth = speedRegex.find(quality)?.let { match ->
             val value = match.groupValues[1].toDoubleOrNull() ?: return@let null
             val multiplier = when (match.groupValues[2].lowercase()) {
@@ -345,7 +341,7 @@ class AniNeko :
             }
             (value * multiplier).toLong()
         }
-        return VideoInfo(videoQuality, audioType, host, bandwidth)
+        return VideoInfo(videoQuality, audioType, bandwidth)
     }
 
     private fun addServerName(serverName: String, quality: String): String =
@@ -472,7 +468,6 @@ class AniNeko :
         private val qualityRegex = Regex("""(?<!\d)(?:360|480|720|1080)p\b""", RegexOption.IGNORE_CASE)
         private val speedRegex = Regex("""(\d+(?:\.\d+)?)\s*(GB|MB|KB|bytes?)/s\b""", RegexOption.IGNORE_CASE)
         private val audioTypes = listOf("Soft Sub", "Hard Sub", "Dub")
-        private val hosts = listOf("HD-1", "HD-2", "StreamHG", "Earnvids", "Doodstream")
         private val qualityOrder = listOf("1080p", "720p", "480p", "360p")
 
         private val GENRES = arrayOf(
