@@ -34,6 +34,13 @@ class AniNeko :
     AnimeHttpSource(),
     ConfigurableAnimeSource {
 
+    private data class VideoInfo(
+        val quality: String?,
+        val audioType: String?,
+        val host: String?,
+        val bandwidth: Long?,
+    )
+
     override val name = "AniNeko"
 
     override val baseUrl = "https://anineko.to"
@@ -283,23 +290,62 @@ class AniNeko :
         val excludedServers = preferences.getStringSet(PREF_EXCLUDE_SERVERS_KEY, emptySet()) ?: emptySet()
         val excludedAudios = preferences.getStringSet(PREF_EXCLUDE_AUDIO_KEY, emptySet()) ?: emptySet()
 
-        val quality = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT)!!
-        val type = preferences.getString(PREF_TYPE_KEY, PREF_TYPE_DEFAULT)!!
-        val host = preferences.getString(PREF_HOST_KEY, PREF_HOST_DEFAULT)!!
+        val preferredQuality = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT)!!
+        val preferredAudioType = preferences.getString(PREF_TYPE_KEY, PREF_TYPE_DEFAULT)!!
+        val preferredHost = preferences.getString(PREF_HOST_KEY, PREF_HOST_DEFAULT)!!
 
-        return videos
+        val parsedVideos = videos
             .filter { video ->
                 val matchesServer = excludedServers.any { video.quality.contains(it, ignoreCase = true) }
                 val matchesAudio = excludedAudios.any { video.quality.contains(it, ignoreCase = true) }
                 !matchesServer && !matchesAudio
             }
+            .map { video -> video to parseVideoInfo(video.quality) }
+
+        return parsedVideos
             .sortedWith(
-                compareBy(
-                    { !it.quality.contains(host, ignoreCase = true) },
-                    { !it.quality.contains(quality, ignoreCase = true) },
-                    { !it.quality.contains(type, ignoreCase = true) },
+                compareBy<Pair<Video, VideoInfo>>(
+                    { (_, info) ->
+                        if (info.quality == preferredQuality &&
+                            info.audioType?.equals(preferredAudioType, ignoreCase = true) == true
+                        ) {
+                            0
+                        } else {
+                            1
+                        }
+                    },
+                    { (_, info) -> if (info.quality == preferredQuality) 0 else 1 },
+                    { (_, info) ->
+                        if (info.audioType?.equals(preferredAudioType, ignoreCase = true) == true) 0 else 1
+                    },
+                    { (_, info) ->
+                        qualityOrder.indexOf(info.quality).let { if (it == -1) Int.MAX_VALUE else it }
+                    },
+                    { (_, info) -> -(info.bandwidth ?: -1L) },
+                    { (_, info) ->
+                        if (info.host?.equals(preferredHost, ignoreCase = true) == true) 0 else 1
+                    },
+                    { (video, _) -> video.quality },
                 ),
             )
+            .map { (video, _) -> video }
+    }
+
+    private fun parseVideoInfo(quality: String): VideoInfo {
+        val videoQuality = qualityRegex.find(quality)?.value?.lowercase()
+        val audioType = audioTypes.firstOrNull { quality.contains(it, ignoreCase = true) }
+        val host = hosts.firstOrNull { quality.startsWith("$it - ", ignoreCase = true) }
+        val bandwidth = speedRegex.find(quality)?.let { match ->
+            val value = match.groupValues[1].toDoubleOrNull() ?: return@let null
+            val multiplier = when (match.groupValues[2].lowercase()) {
+                "gb" -> 1_000_000_000
+                "mb" -> 1_000_000
+                "kb" -> 1_000
+                else -> 1
+            }
+            (value * multiplier).toLong()
+        }
+        return VideoInfo(videoQuality, audioType, host, bandwidth)
     }
 
     private fun addServerName(serverName: String, quality: String): String =
@@ -423,6 +469,11 @@ class AniNeko :
         private const val PREF_SHOW_THUMBNAILS_KEY = "pref_show_thumbnails"
 
         private val vibeRegex = Regex("""const src\s*=\s*"([^"]+)"""")
+        private val qualityRegex = Regex("""(?<!\d)(?:360|480|720|1080)p\b""", RegexOption.IGNORE_CASE)
+        private val speedRegex = Regex("""(\d+(?:\.\d+)?)\s*(GB|MB|KB|bytes?)/s\b""", RegexOption.IGNORE_CASE)
+        private val audioTypes = listOf("Soft Sub", "Hard Sub", "Dub")
+        private val hosts = listOf("HD-1", "HD-2", "StreamHG", "Earnvids", "Doodstream")
+        private val qualityOrder = listOf("1080p", "720p", "480p", "360p")
 
         private val GENRES = arrayOf(
             Pair("Action", "action"),
