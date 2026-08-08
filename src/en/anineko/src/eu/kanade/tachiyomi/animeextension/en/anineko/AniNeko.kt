@@ -185,7 +185,6 @@ class AniNeko :
     override fun episodeListParse(response: Response): List<SEpisode> {
         val document = response.useAsJsoup()
         val episodes = document.select("div.nv-info-episode-grid article.nv-info-episode-item")
-        val showThumbnails = preferences.getBoolean(PREF_SHOW_THUMBNAILS_KEY, true)
 
         val list = episodes.map { element ->
             SEpisode.create().apply {
@@ -194,9 +193,6 @@ class AniNeko :
 
                 val titleEl = linkEl.selectFirst("strong")
                 name = titleEl?.text() ?: linkEl.text()
-                if (showThumbnails) {
-                    thumbnail_url = linkEl.selectFirst("img")?.attr("src")
-                }
 
                 episode_number = name.substringAfter("Episode").trim().toFloatOrNull() ?: 1.0f
             }
@@ -406,12 +402,6 @@ class AniNeko :
             default = PREF_TITLE_LANG_DEFAULT,
             summary = "%s",
         )
-        screen.addSwitchPreference(
-            key = PREF_SHOW_THUMBNAILS_KEY,
-            title = "Show episode thumbnails",
-            summary = "Fetch and display images in the episode list.",
-            default = true,
-        )
     }
 
     // ============================== Filters ==============================
@@ -465,8 +455,6 @@ class AniNeko :
 
         private const val PREF_TITLE_LANG_KEY = "preferred_title_lang"
         private const val PREF_TITLE_LANG_DEFAULT = "English"
-
-        private const val PREF_SHOW_THUMBNAILS_KEY = "pref_show_thumbnails"
 
         private val vibeRegex = Regex("""const src\s*=\s*"([^"]+)"""")
         private val qualityRegex = Regex("""(?<!\d)(?:360|480|720|1080)p\b""", RegexOption.IGNORE_CASE)
