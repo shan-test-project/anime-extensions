@@ -15,11 +15,16 @@ import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.awaitSuccess
 import keiyoushi.utils.addListPreference
 import keiyoushi.utils.addSetPreference
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parallelCatchingFlatMapBlocking
 import keiyoushi.utils.useAsJsoup
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
@@ -35,6 +40,8 @@ class AniNeko :
     override val lang = "en"
 
     override val supportsLatest = true
+
+    override val disableRelatedAnimesBySearch = true
 
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
@@ -195,6 +202,78 @@ class AniNeko :
                 baseDesc
             }
         }
+    }
+
+    // =========================== Related Anime ==========================
+
+    override fun relatedAnimeListRequest(anime: SAnime): Request = GET("$baseUrl${anime.url}", headers)
+
+    override fun relatedAnimeListParse(response: Response): List<SAnime> {
+        val document = response.useAsJsoup()
+        return document.select("div.nv-info-related-list article").mapNotNull { article ->
+            val linkEl = article.selectFirst("a")
+            val url = linkEl?.attr("href") ?: return@mapNotNull null
+            val title = article.selectFirst("h3 a")?.text()
+                ?: linkEl.selectFirst("img")?.attr("alt")
+                ?: return@mapNotNull null
+            val thumbnail = linkEl.selectFirst("img")?.attr("src")
+
+            SAnime.create().apply {
+                this.url = url
+                this.title = title
+                this.thumbnail_url = thumbnail
+            }
+        }
+    }
+
+    override suspend fun fetchRelatedAnimeList(anime: SAnime): List<SAnime> = coroutineScope {
+        val explicitRelated = try {
+            val response = client.newCall(relatedAnimeListRequest(anime)).awaitSuccess()
+            relatedAnimeListParse(response)
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            emptyList()
+        }
+
+        val titleWords = anime.title.split(" ")
+            .map { it.filter { c -> c.isLetterOrDigit() } }
+            .filter { it.length >= 2 }
+            .take(3)
+
+        val titleSearch = async {
+            if (titleWords.isEmpty()) return@async emptyList()
+            val query = titleWords.joinToString(" ")
+            try {
+                val searchUrl = "$baseUrl/browse".toHttpUrl().newBuilder().apply {
+                    addQueryParameter("page", "1")
+                    addQueryParameter("keyword", query)
+                }.build()
+                val resp = client.newCall(GET(searchUrl, headers)).awaitSuccess()
+                searchAnimeParse(resp).animes.filter { it.url != anime.url }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                emptyList()
+            }
+        }
+
+        val genres = anime.genre?.split(", ")?.map { it.trim().lowercase().replace(" ", "-") } ?: emptyList()
+        val genreSearch = async {
+            if (genres.isEmpty()) return@async emptyList()
+            try {
+                val searchUrl = "$baseUrl/browse".toHttpUrl().newBuilder().apply {
+                    addQueryParameter("page", "1")
+                    genres.take(2).forEach { addQueryParameter("genre[]", it) }
+                }.build()
+                val resp = client.newCall(GET(searchUrl, headers)).awaitSuccess()
+                searchAnimeParse(resp).animes.filter { it.url != anime.url }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                emptyList()
+            }
+        }
+
+        (explicitRelated + listOf(titleSearch, genreSearch).awaitAll().flatten())
+            .distinctBy { it.url }
     }
 
     // =========================== Episode List ===========================
