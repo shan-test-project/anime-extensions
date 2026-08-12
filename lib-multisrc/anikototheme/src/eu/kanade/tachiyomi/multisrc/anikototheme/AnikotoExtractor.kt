@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.multisrc.anikototheme
 
 import android.util.Base64
 import android.util.Log
+import aniyomi.lib.m3u8server.M3u8Integration
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
@@ -17,15 +18,22 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.jsoup.nodes.Document
 
 class AnikotoExtractor(private val theme: AnikotoTheme) {
+    private val m3u8Integration by lazy { M3u8Integration(theme.playlistClient) }
 
     suspend fun extractVideos(document: Document, episode: SEpisode, epUrl: String): List<Video> {
         val serverData = theme.parseServerListData(document).toMutableList()
         val mapperServers = fetchMapperServers(episode)
         serverData.addAll(mapperServers)
 
-        return serverData.parallelCatchingFlatMap { server ->
+        val videos = serverData.parallelCatchingFlatMap { server ->
             extractVideo(server, epUrl)
         }
+
+        // Some Anikoto CDNs return HLS segments with an image wrapper and require
+        // the player request to carry the embed referer. Route HLS through the
+        // shared local proxy so both the headers and the segment byte cleanup are
+        // preserved during playback.
+        return m3u8Integration.processVideoList(videos)
     }
 
     private suspend fun getEmbedLink(serverId: String, epUrl: String): String {

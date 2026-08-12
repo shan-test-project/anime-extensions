@@ -535,7 +535,7 @@ abstract class AnikotoTheme(
             return emptyList()
         }
 
-        return extractors.extractVideos(document, episode, epUrl)
+        return extractors.extractVideos(document, episode, epUrl).sort()
     }
 
     override fun videoListSelector() = throw UnsupportedOperationException()
@@ -545,20 +545,23 @@ abstract class AnikotoTheme(
     // ============================ Video Sort ==============================
 
     override fun List<Video>.sort(): List<Video> {
-        val quality = prefQuality
+        val preferredQuality = prefQuality
         val preferredServer = prefServer
-        val preferredBase = extractBaseServerName(prefServer)
-        val type = prefType
-        val qualitiesList = PREF_QUALITY_ENTRIES.reversed()
-
-        val sortType = buildTypeFallbackChain(type)
+        val preferredBase = extractBaseServerName(preferredServer)
+        val typeFallbackChain = buildTypeFallbackChain(prefType)
+        val qualities = PREF_QUALITY_ENTRIES.toList()
 
         return sortedWith(
-            compareByDescending<Video> { it.quality.contains(quality) }
-                .thenByDescending { video -> qualitiesList.indexOfLast { video.quality.contains(it) } }
-                .thenByDescending { sortType.any { t -> it.quality.contains(" - $t ", true) } }
+            compareByDescending<Video> { video ->
+                videoQuality(video.quality).equals(preferredQuality, ignoreCase = true)
+            }
+                .thenBy { video -> qualities.indexOf(videoQuality(video.quality)).takeIf { it >= 0 } ?: Int.MAX_VALUE }
+                .thenBy { video ->
+                    typeFallbackChain.indexOfFirst { it.equals(videoType(video.quality), ignoreCase = true) }
+                        .takeIf { it >= 0 } ?: Int.MAX_VALUE
+                }
                 .thenByDescending { video ->
-                    val videoServer = video.quality.substringBefore(" - ")
+                    val videoServer = videoServer(video.quality)
                     when {
                         videoServer.equals(preferredServer, ignoreCase = true) -> 2
                         extractBaseServerName(videoServer).equals(preferredBase, ignoreCase = true) -> 1
@@ -566,6 +569,18 @@ abstract class AnikotoTheme(
                     }
                 },
         )
+    }
+
+    private fun videoServer(quality: String): String = quality.substringBefore(" - ").trim()
+
+    private fun videoType(quality: String): String =
+        quality.substringAfter(" - ", "").substringBefore(" - ").trim()
+
+    private fun videoQuality(quality: String): String {
+        val qualityText = quality.substringAfterLast(" - ").trim()
+        return PREF_QUALITY_ENTRIES.firstOrNull { qualityText.contains(it, ignoreCase = true) }
+            ?: PREF_QUALITY_ENTRIES.firstOrNull { quality.contains("${it}p", ignoreCase = true) }
+            ?: ""
     }
 
     protected open fun buildTypeFallbackChain(type: String): List<String> = when (type) {
