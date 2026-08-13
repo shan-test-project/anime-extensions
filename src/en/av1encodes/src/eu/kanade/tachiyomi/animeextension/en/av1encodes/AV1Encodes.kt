@@ -66,87 +66,38 @@ class AV1Encodes :
     // POPULAR
     // ══════════════════════════════════════════════════════════════════════════
 
-    override fun popularAnimeRequest(page: Int): Request = GET("$baseUrl/stats#top-downloads", headers)
+    // The /stats page is now a client-rendered Next.js shell with no anime
+    // links in the static HTML. Hit the JSON endpoint the page itself uses.
+    override fun popularAnimeRequest(page: Int): Request = GET(
+        "$baseUrl/stats/data?page=$page",
+        headers.newBuilder()
+            .set("Accept", "application/json, text/plain, */*")
+            .set("Referer", "$baseUrl/stats")
+            .set("Origin", baseUrl)
+            .build(),
+    )
 
-    override fun popularAnimeParse(response: Response): AnimesPage = AnimesPage(parseStatsPage(response.useAsJsoup()), false)
+    override fun popularAnimeParse(response: Response): AnimesPage {
+        val payload = response.parseAs<TopDownloadsResponse>()
+        val animes = payload.mostDownloadedFiles.mapNotNull { item ->
+            val filename = item.id
+            val title = extractCleanTitle(filename)
+            val slug = title.lowercase(Locale.US)
+                .replace(specialCharactersRegex, "-")
+                .trim('-')
+            if (slug.length < 3) return@mapNotNull null
+            SAnime.create().apply {
+                setUrlWithoutDomain("/anime/$slug")
+                title = title
+            }
+        }.distinctBy { it.url }
+        val hasNext = payload.page < payload.totalPages
+        return AnimesPage(animes, hasNext)
+    }
 
     private val seasonRegex by lazy { Regex("""\[S\d""") }
     private val animeNameRegex by lazy { Regex("""\[S\d{1,2}(?:-E\d+)?]\s*([^\[]+?)\s*\[""") }
     private val specialCharactersRegex by lazy { Regex("[^a-z0-9]+") }
-
-    private fun parseStatsPage(doc: Document): List<SAnime> {
-        val seen = mutableSetOf<String>()
-        val animes = mutableListOf<SAnime>()
-
-        var searchContext: Element = doc
-        val header = doc.select("h1,h2,h3,h4,h5,h6").firstOrNull {
-            it.text().contains("Top Downloads", ignoreCase = true)
-        }
-        if (header != null) {
-            val sibling = header.nextElementSibling()
-            searchContext = if (sibling != null && sibling.text().length > 20) {
-                sibling
-            } else {
-                header.parent() ?: doc
-            }
-        }
-
-        searchContext.select("a[href*='/anime/'],div[class*='card'],div[class*='item'],li")
-            .filter { el ->
-                val text = el.text().trim()
-                text.contains(seasonRegex) || text.length in 10..200
-            }
-            .forEach { el ->
-                val link = el.selectFirst("a[href*='/anime/']")
-                    ?: el.takeIf { it.tagName() == "a" && it.attr("href").contains("/anime/") }
-                if (link != null) {
-                    val url = link.attr("href").let {
-                        if (it.startsWith("http")) it.removePrefix(baseUrl) else it
-                    }
-                    if (url.startsWith("/anime/") && seen.add(url)) {
-                        animes.add(
-                            SAnime.create().apply {
-                                setUrlWithoutDomain(url)
-                                title = extractCleanTitle(el.text())
-                                thumbnail_url = getListImageUrl(el)
-                            },
-                        )
-                    }
-                    return@forEach
-                }
-
-                val animeName = extractCleanTitle(el.text().trim())
-                val slug = animeName.lowercase(Locale.US).replace(specialCharactersRegex, "-").trim('-')
-                if (slug.length < 3 || !seen.add("/anime/$slug")) return@forEach
-                animes.add(
-                    SAnime.create().apply {
-                        setUrlWithoutDomain("/anime/$slug")
-                        title = animeName
-                    },
-                )
-            }
-
-        if (animes.isEmpty()) {
-            animeNameRegex.findAll(searchContext.text())
-                .map { it.groupValues[1].trim() }
-                .distinct()
-                .take(20)
-                .forEach { animeName ->
-                    val slug = animeName.lowercase(Locale.US)
-                        .replace(specialCharactersRegex, "-").trim('-')
-                    if (slug.length >= 3 && seen.add("/anime/$slug")) {
-                        animes.add(
-                            SAnime.create().apply {
-                                setUrlWithoutDomain("/anime/$slug")
-                                title = extractCleanTitle(animeName)
-                            },
-                        )
-                    }
-                }
-        }
-
-        return animes.fetchMissingCovers()
-    }
 
     // ══════════════════════════════════════════════════════════════════════════
     // LATEST

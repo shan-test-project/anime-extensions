@@ -49,6 +49,22 @@ internal data class VideoDetailInfo(
     @SerialName("duration") val duration: String? = null,
 )
 
+// ADDED: Model for /stats/data — the live "Top Downloads" payload. The page
+// is fully client-rendered now, so we hit the JSON endpoint instead of scraping
+// the empty HTML shell. The popular parser maps each filename into an SAnime.
+@Serializable
+internal data class TopDownloadItem(
+    @SerialName("_id") val id: String = "",
+    @SerialName("count") val count: Int = 0,
+)
+
+@Serializable
+internal data class TopDownloadsResponse(
+    @SerialName("most_downloaded_files") val mostDownloadedFiles: List<TopDownloadItem> = emptyList(),
+    @SerialName("page") val page: Int = 1,
+    @SerialName("total_pages") val totalPages: Int = 1,
+)
+
 // ADDED: Model for a single item in the /episodes/ JSON array response.
 // The API now returns a JSON array where each item includes the episode href
 // (with the ?token= query param already embedded) and optionally the full DDL
