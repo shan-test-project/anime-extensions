@@ -573,8 +573,7 @@ abstract class AnikotoTheme(
 
     private fun videoServer(quality: String): String = quality.substringBefore(" - ").trim()
 
-    private fun videoType(quality: String): String =
-        quality.substringAfter(" - ", "").substringBefore(" - ").trim()
+    private fun videoType(quality: String): String = quality.substringAfter(" - ", "").substringBefore(" - ").trim()
 
     private fun videoQuality(quality: String): String {
         val qualityText = quality.substringAfterLast(" - ").trim()
