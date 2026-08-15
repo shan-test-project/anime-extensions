@@ -116,6 +116,9 @@ jobs:
         with:
           cache-read-only: ${{ matrix.chunk.number > 1 }}
 
+      - name: Apply Spotless formatting
+        run: ./gradlew :src:en:av1encodes:spotlessApply
+
       - name: Build extensions (${{ matrix.chunk.number }})
         env:
           MODULES: ${{ join(matrix.chunk.modules, ' ') }}
