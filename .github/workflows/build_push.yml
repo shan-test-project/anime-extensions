@@ -83,7 +83,12 @@ jobs:
       - id: generate-matrices
         name: Create output matrices
         run: |
-          python ./.github/scripts/generate-build-matrices.py "$NX_BASE" Debug
+          if [ "${{ github.repository }}" = "yuzono/anime-extensions" ]; then
+            python ./.github/scripts/generate-build-matrices.py "$NX_BASE" Debug
+          else
+            echo 'matrix={"chunk":[{"number":1,"modules":[":src:en:av1encodes:assembleDebug"]}]}' >> "$GITHUB_OUTPUT"
+            echo 'delete=["en.av1encodes"]' >> "$GITHUB_OUTPUT"
+          fi
 
   build:
     name: Build extensions (${{ matrix.chunk.number }})
