@@ -66,9 +66,16 @@ class AV1Encodes :
     // POPULAR
     // ══════════════════════════════════════════════════════════════════════════
 
-    override fun popularAnimeRequest(page: Int): Request = GET("$baseUrl/stats#top-downloads", headers)
+    override fun popularAnimeRequest(page: Int): Request = GET(baseUrl, headers)
 
-    override fun popularAnimeParse(response: Response): AnimesPage = AnimesPage(parseStatsPage(response.useAsJsoup()), false)
+    override fun popularAnimeParse(response: Response): AnimesPage {
+        val doc = response.useAsJsoup()
+        val spotlight = parseSpotlightList(doc)
+        return AnimesPage(
+            if (spotlight.isNotEmpty()) spotlight else parseCardList(doc).animes,
+            false,
+        )
+    }
 
     private val seasonRegex by lazy { Regex("""\[S\d""") }
     private val animeNameRegex by lazy { Regex("""\[S\d{1,2}(?:-E\d+)?]\s*([^\[]+?)\s*\[""") }
@@ -100,9 +107,7 @@ class AV1Encodes :
                 val link = el.selectFirst("a[href*='/anime/']")
                     ?: el.takeIf { it.tagName() == "a" && it.attr("href").contains("/anime/") }
                 if (link != null) {
-                    val url = link.attr("href").let {
-                        if (it.startsWith("http")) it.removePrefix(baseUrl) else it
-                    }
+                    val url = normalizePath(link.attr("href"))
                     if (url.startsWith("/anime/") && seen.add(url)) {
                         animes.add(
                             SAnime.create().apply {
@@ -148,6 +153,26 @@ class AV1Encodes :
         return animes.fetchMissingCovers()
     }
 
+    private fun parseSpotlightList(doc: Document): List<SAnime> {
+        return doc.select("article.spotlight-slide, .spotlight-slide").mapNotNull { slide ->
+            val link = slide.selectFirst("a[href*='/anime/']") ?: return@mapNotNull null
+            val url = normalizePath(link.attr("href"))
+            if (!url.startsWith("/anime/") || url == "/anime/") return@mapNotNull null
+
+            SAnime.create().apply {
+                setUrlWithoutDomain(url)
+                title = slide.selectFirst(".spotlight-title, h3, h4")?.text()?.trim()
+                    ?.ifBlank { null }
+                    ?: link.text().trim()
+                thumbnail_url = slide.selectFirst("img")?.let { image ->
+                    image.attr("abs:data-src").ifBlank { null }
+                        ?: image.attr("abs:data-lazy-src").ifBlank { null }
+                        ?: image.attr("abs:src").ifBlank { null }
+                }
+            }.takeIf { it.title.isNotBlank() }
+        }.distinctBy { it.url }
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // LATEST
     // ══════════════════════════════════════════════════════════════════════════
@@ -158,9 +183,7 @@ class AV1Encodes :
         val doc = response.useAsJsoup()
         val animes = doc.select("article.anime-card").mapNotNull { card ->
             val a = card.selectFirst("h4 > a, .card-body a") ?: return@mapNotNull null
-            val href = a.attr("href").let {
-                if (it.startsWith("http")) it.removePrefix(baseUrl) else it
-            }
+            val href = normalizePath(a.attr("href"))
             if (!href.startsWith("/anime/") || href == "/anime/") return@mapNotNull null
             SAnime.create().apply {
                 setUrlWithoutDomain(href)
@@ -245,9 +268,7 @@ class AV1Encodes :
             .mapNotNull { card ->
                 val a = card.selectFirst("h3 > a, h4 > a, .card-body a, a[href*='/anime/']")
                     ?: return@mapNotNull null
-                val href = a.attr("href").let {
-                    if (it.startsWith("http")) it.removePrefix(baseUrl) else it
-                }
+                val href = normalizePath(a.attr("href"))
                 if (!href.startsWith("/anime/") || href == "/anime/") return@mapNotNull null
                 val img = card.selectFirst("div.poster-wrap > img, img")
                 SAnime.create().apply {
@@ -272,9 +293,7 @@ class AV1Encodes :
                 val a = block.selectFirst("a[href*='/anime/']")
                     ?: block.parent()?.selectFirst("a[href*='/anime/']")
                     ?: return@mapNotNull null
-                val href = a.attr("href").let {
-                    if (it.startsWith("http")) it.removePrefix(baseUrl) else it
-                }
+                val href = normalizePath(a.attr("href"))
                 if (!href.startsWith("/anime/") || href == "/anime/") return@mapNotNull null
                 val img = block.parent()?.selectFirst("img") ?: block.selectFirst("img")
                 SAnime.create().apply {
@@ -551,6 +570,14 @@ class AV1Encodes :
             videos.add(Video(dlUrl, "$qualLabel · Direct DL", dlUrl))
         }
 
+        if (preferences.getBoolean(PREF_SHOW_TORRENT_KEY, PREF_SHOW_TORRENT_DEFAULT)) {
+            val torrentUrl = resolveRedirect(ddl.torrentLink)
+            if (torrentUrl != null) {
+                Log.d(TAG, "getVideoList: torrent URL → $torrentUrl")
+                videos.add(Video(torrentUrl, "$qualLabel · Torrent", torrentUrl))
+            }
+        }
+
         if (videos.isEmpty()) {
             Log.w(TAG, "getVideoList: no videos from get_ddl, falling back")
             return fallbackDirectUrl(episodeUrl, filename)
@@ -622,6 +649,27 @@ class AV1Encodes :
         cleaned = cleaned.replace(cleanTitleRegex3, "")
         cleaned = cleaned.replace(cleanTitleRegex4, "")
         return cleaned.trim()
+    }
+
+    private fun normalizePath(href: String): String {
+        val value = href.trim()
+        if (value.startsWith("/")) return value
+        if (!value.startsWith("http", ignoreCase = true)) return value
+
+        return runCatching {
+            val url = value.toHttpUrl()
+            val hostIsAllowed = url.host == baseUrl.toHttpUrl().host ||
+                url.host.endsWith(".av1encodes.com") ||
+                url.host.endsWith(".av1please.com")
+            if (hostIsAllowed) {
+                buildString {
+                    append(url.encodedPath)
+                    url.encodedQuery?.let { append('?').append(it) }
+                }
+            } else {
+                ""
+            }
+        }.getOrDefault("")
     }
 
     private fun getListImageUrl(anchor: Element): String? {
