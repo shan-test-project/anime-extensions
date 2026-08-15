@@ -43,8 +43,11 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Run Spotless
+        run: ./gradlew spotlessApply
+
       - name: Build AniNeko APK
-        run: ./gradlew :src:en:anineko:assembleRelease -x spotlessCheck
+        run: ./gradlew :src:en:anineko:assembleRelease
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
