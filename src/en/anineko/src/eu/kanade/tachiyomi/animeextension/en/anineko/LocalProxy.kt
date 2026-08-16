@@ -5,6 +5,7 @@ import android.util.Base64
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
+import java.io.InputStream
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.Executors
@@ -54,7 +55,13 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
             sb.toString()
         } ?: ""
         val encodedHeaders = Base64.encodeToString(headersStr.toByteArray(), Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
-        val ext = if (targetUrl.contains(".m3u8") || targetUrl.contains("mpegurl")) "playlist.m3u8" else "segment.ts"
+        val ext = if (targetUrl.contains(".m3u8", ignoreCase = true) ||
+            targetUrl.contains("mpegurl", ignoreCase = true)
+        ) {
+            "playlist.m3u8"
+        } else {
+            "segment.ts"
+        }
         return "http://127.0.0.1:$port/proxy/$ext?url=$encodedUrl&headers=$encodedHeaders"
     }
 
@@ -92,7 +99,8 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
             }
 
             val targetUrl = String(Base64.decode(encodedUrl, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING))
-            val isM3u8Request = targetUrl.contains(".m3u8") || path.contains("playlist.m3u8")
+            val isM3u8Request = targetUrl.contains(".m3u8", ignoreCase = true) ||
+                path.contains("playlist.m3u8", ignoreCase = true)
 
             val targetHeaders = okhttp3.Headers.Builder()
             if (encodedHeaders.isNotEmpty()) {
@@ -168,42 +176,138 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
             return
         }
 
-        val rawBody = response.body.bytes()
         if (!response.isSuccessful) {
             // Preserve upstream errors instead of presenting an HTML/error body as MPEG-TS.
-            out.write("HTTP/1.1 ${response.code} ${response.message}\r\n".toByteArray())
-            writeForwardedHeaders(out, response, isM3u8 = false)
-            out.write("Content-Length: ${rawBody.size}\r\n".toByteArray())
-            out.write("Content-Type: ${response.header("Content-Type") ?: "text/plain"}\r\n".toByteArray())
-            out.write("Connection: close\r\n\r\n".toByteArray())
-            out.write(rawBody)
+            writeResponseHeaders(
+                out,
+                response,
+                response.code,
+                response.header("Content-Type") ?: "text/plain",
+                response.body.contentLength(),
+            )
+            response.body.byteStream().use { input ->
+                input.copyTo(out, COPY_BUFFER_SIZE)
+            }
             out.flush()
             return
         }
 
+        val contentType = response.header("Content-Type")
+        val contentLength = response.body.contentLength()
+        val isPngWrapped = contentType?.contains("image/png", ignoreCase = true) == true
+
+        // Stream normal segments as they arrive. Buffering an entire segment before
+        // writing it makes the player stall and causes visible HLS frame glitches.
+        if (!isPngWrapped && clientRange == null) {
+            writeResponseHeaders(
+                out,
+                response,
+                response.code,
+                contentType ?: "application/octet-stream",
+                contentLength,
+            )
+            response.body.byteStream().use { input ->
+                input.copyTo(out, COPY_BUFFER_SIZE)
+            }
+            out.flush()
+            return
+        }
+
+        // For direct byte-range responses, seek and stream only the requested
+        // bytes. PNG-wrapped responses still use the buffered path below because
+        // their playable byte offsets are different from the upstream offsets.
+        if (!isPngWrapped && clientRange != null && contentLength in 1L..Int.MAX_VALUE.toLong()) {
+            val range = parseRange(clientRange, contentLength.toInt())
+            if (range != null) {
+                writeResponseHeaders(
+                    out,
+                    response,
+                    206,
+                    contentType ?: "application/octet-stream",
+                    (range.last - range.first + 1).toLong(),
+                    range,
+                    contentLength,
+                )
+                response.body.byteStream().use { input ->
+                    skipFully(input, range.first.toLong())
+                    copyExactly(input, out, range.last - range.first + 1)
+                }
+                out.flush()
+                return
+            }
+        }
+
         // Some hosts wrap MPEG-TS in a PNG response. Strip that wrapper before
         // applying the player's byte range so range playback remains consistent.
+        val rawBody = response.body.bytes()
         val stripped = stripPngHeader(rawBody)
         val range = parseRange(clientRange, stripped.size)
         val body = range?.let { stripped.copyOfRange(it.first, it.last + 1) } ?: stripped
         val status = if (range == null) 200 else 206
-        val contentType = if (isMpegTs(stripped)) {
+        val playableContentType = if (isMpegTs(stripped)) {
             "video/mp2t"
         } else {
             response.header("Content-Type") ?: "application/octet-stream"
         }
 
-        out.write("HTTP/1.1 $status ${if (status == 206) "Partial Content" else "OK"}\r\n".toByteArray())
-        writeForwardedHeaders(out, response, isM3u8 = false)
-        if (range != null) {
-            out.write("Accept-Ranges: bytes\r\n".toByteArray())
-            out.write("Content-Range: bytes ${range.first}-${range.last}/${stripped.size}\r\n".toByteArray())
-        }
-        out.write("Content-Length: ${body.size}\r\n".toByteArray())
-        out.write("Content-Type: $contentType\r\n".toByteArray())
-        out.write("Connection: close\r\n\r\n".toByteArray())
+        writeResponseHeaders(
+            out,
+            response,
+            status,
+            playableContentType,
+            body.size.toLong(),
+            range,
+            stripped.size.toLong(),
+        )
         out.write(body)
         out.flush()
+    }
+
+    private fun writeResponseHeaders(
+        out: java.io.OutputStream,
+        response: Response,
+        status: Int,
+        contentType: String,
+        contentLength: Long,
+        range: IntRange? = null,
+        totalLength: Long? = null,
+    ) {
+        out.write("HTTP/1.1 $status ${if (status == 206) "Partial Content" else response.message}\r\n".toByteArray())
+        writeForwardedHeaders(out, response, isM3u8 = false)
+        if (range != null && totalLength != null) {
+            out.write("Accept-Ranges: bytes\r\n".toByteArray())
+            out.write("Content-Range: bytes ${range.first}-${range.last}/$totalLength\r\n".toByteArray())
+        }
+        if (contentLength >= 0) {
+            out.write("Content-Length: $contentLength\r\n".toByteArray())
+        }
+        out.write("Content-Type: $contentType\r\n".toByteArray())
+        out.write("Connection: close\r\n\r\n".toByteArray())
+    }
+
+    private fun skipFully(input: InputStream, count: Long) {
+        var remaining = count
+        while (remaining > 0) {
+            val skipped = input.skip(remaining)
+            if (skipped > 0) {
+                remaining -= skipped
+            } else if (input.read() == -1) {
+                return
+            } else {
+                remaining--
+            }
+        }
+    }
+
+    private fun copyExactly(input: InputStream, out: java.io.OutputStream, count: Int) {
+        var remaining = count
+        val buffer = ByteArray(min(COPY_BUFFER_SIZE, count.coerceAtLeast(1)))
+        while (remaining > 0) {
+            val read = input.read(buffer, 0, min(buffer.size, remaining))
+            if (read == -1) return
+            out.write(buffer, 0, read)
+            remaining -= read
+        }
     }
 
     private fun writeForwardedHeaders(
@@ -239,7 +343,8 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
         val end = parts[1].toIntOrNull()
         return when {
             start != null && start >= 0 && start < size -> {
-                start..min(end ?: (size - 1), size - 1)
+                val last = min(end ?: (size - 1), size - 1)
+                if (last < start) null else start..last
             }
             start == null && end != null && end > 0 -> {
                 maxOf(0, size - end)..<size
@@ -283,8 +388,18 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
 
     private fun getProxyUrlWithEncodedHeaders(targetUrl: String, encodedHeaders: String): String {
         val encodedUrl = Base64.encodeToString(targetUrl.toByteArray(), Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
-        val ext = if (targetUrl.contains(".m3u8") || targetUrl.contains("mpegurl")) "playlist.m3u8" else "segment.ts"
+        val ext = if (targetUrl.contains(".m3u8", ignoreCase = true) ||
+            targetUrl.contains("mpegurl", ignoreCase = true)
+        ) {
+            "playlist.m3u8"
+        } else {
+            "segment.ts"
+        }
         return "http://127.0.0.1:$port/proxy/$ext?url=$encodedUrl&headers=$encodedHeaders"
+    }
+
+    companion object {
+        private const val COPY_BUFFER_SIZE = 64 * 1024
     }
 
     private fun resolveUrl(baseUrl: String, relativeUrl: String): String = try {

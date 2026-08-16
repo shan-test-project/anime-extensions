@@ -56,7 +56,7 @@ class AniNeko :
     // Keep host extraction responsive when one provider is slow or unavailable.
     private val extractorClient by lazy {
         client.newBuilder()
-            .callTimeout(20, TimeUnit.SECONDS)
+            .callTimeout(15, TimeUnit.SECONDS)
             .build()
     }
 
