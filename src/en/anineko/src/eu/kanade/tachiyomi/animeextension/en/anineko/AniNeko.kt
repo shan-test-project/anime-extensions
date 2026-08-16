@@ -26,7 +26,6 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import java.util.concurrent.TimeUnit
 import okhttp3.Request
 import okhttp3.Response
 
@@ -52,13 +51,6 @@ class AniNeko :
     private val localProxy by lazy { LocalProxy(client) }
 
     private val playlistUtils by lazy { PlaylistUtils(client, headers) }
-
-    // Keep host extraction responsive when one provider is slow or unavailable.
-    private val extractorClient by lazy {
-        client.newBuilder()
-            .callTimeout(15, TimeUnit.SECONDS)
-            .build()
-    }
 
     // ============================= Popular ==============================
 
@@ -346,7 +338,7 @@ class AniNeko :
 
             when {
                 iframeUrl.contains("vivibebe.site") || iframeUrl.contains("vibevibe.workers.dev") || iframeUrl.contains("bibiemb.xyz") -> {
-                    val iframeHtml = extractorClient.newCall(GET(iframeUrl, streamHeaders)).execute().use {
+                    val iframeHtml = client.newCall(GET(iframeUrl, streamHeaders)).execute().use {
                         it.body.string()
                     }
                     val m3u8Url = vibeRegex.find(iframeHtml)?.groupValues?.get(1)
@@ -368,7 +360,7 @@ class AniNeko :
                 }
 
                 iframeUrl.contains("otakuhg.site") || iframeUrl.contains("otakuvid.online") -> {
-                    val extractor = VidHideExtractor(extractorClient, streamHeaders)
+                    val extractor = VidHideExtractor(client, streamHeaders)
                     extractor.videosFromUrl(iframeUrl) { quality -> "$versionType - $quality" }.map { video ->
                         Video(
                             url = video.url,
@@ -381,7 +373,7 @@ class AniNeko :
                 }
 
                 iframeUrl.contains("playmogo.com") || iframeUrl.contains("dood") -> {
-                    val extractor = DoodExtractor(extractorClient)
+                    val extractor = DoodExtractor(client)
                     extractor.videosFromUrl(iframeUrl, quality = versionType).map { video ->
                         Video(
                             url = video.url,
@@ -409,11 +401,6 @@ class AniNeko :
                 val matchesServer = excludedServers.any { video.quality.contains(it, ignoreCase = true) }
                 val matchesAudio = excludedAudios.any { video.quality.contains(it, ignoreCase = true) }
                 !matchesServer && !matchesAudio
-            }
-            // Filter out bare "Video" tracks that lack a standard resolution
-            .filterNot { video ->
-                video.quality.contains("Video", ignoreCase = true) &&
-                    QUALITY_ENTRIES.none { video.quality.contains(it, ignoreCase = true) }
             }
 
         val isDoodPreferred = preferredHost.equals("Doodstream", ignoreCase = true)
@@ -516,7 +503,7 @@ class AniNeko :
 
         const val TYPE_KEY = "preferred_type"
         const val TYPE_DEFAULT = "Soft Sub"
-        val TYPE_ENTRIES = listOf("Soft Sub", "Hard Sub", "Dub")
+        val TYPE_ENTRIES = listOf("Soft Sub", "Hard Sub", "Dub", "Raw")
 
         const val HOST_KEY = "preferred_host"
         const val HOST_DEFAULT = "HD-1"
