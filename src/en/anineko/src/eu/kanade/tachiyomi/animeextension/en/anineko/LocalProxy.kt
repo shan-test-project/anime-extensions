@@ -32,6 +32,7 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
                     try {
                         val socket = ss.accept()
                         socket.soTimeout = 30_000
+                        socket.tcpNoDelay = true
                         executor.execute { handleSocket(socket) }
                     } catch (_: Exception) {}
                 }
@@ -128,14 +129,27 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
                 }
             }
 
+            val upstreamHeaders = targetHeaders.build()
             val request = Request.Builder()
                 .url(targetUrl)
-                .headers(targetHeaders.build())
+                .headers(upstreamHeaders)
+                .apply {
+                    if (clientRange != null && !isM3u8Request && upstreamHeaders["Range"] == null) {
+                        header("Range", clientRange)
+                    }
+                }
                 .build()
 
             requestParsed = true
             client.newCall(request).execute().use { response ->
-                sendResponse(socket, response, targetUrl, encodedHeaders, clientRange)
+                if (clientRange != null && response.code == 206 && isPngResponse(response)) {
+                    response.close()
+                    client.newCall(request.newBuilder().removeHeader("Range").build()).execute().use { fullResponse ->
+                        sendResponse(socket, fullResponse, targetUrl, encodedHeaders, clientRange)
+                    }
+                } else {
+                    sendResponse(socket, response, targetUrl, encodedHeaders, clientRange)
+                }
             }
         } catch (e: Exception) {
             // Only attempt to send an HTTP error response when the request was fully parsed
@@ -195,6 +209,24 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
         val contentType = response.header("Content-Type")
         val contentLength = response.body.contentLength()
         val isPngWrapped = contentType?.contains("image/png", ignoreCase = true) == true
+
+        // Hosts that honor Range can send the requested bytes directly. Forward
+        // their partial response instead of seeking through the entire segment.
+        if (!isPngWrapped && clientRange != null && response.code == 206) {
+            writeResponseHeaders(
+                out,
+                response,
+                206,
+                contentType ?: "application/octet-stream",
+                contentLength,
+                preserveRangeHeaders = true,
+            )
+            response.body.byteStream().use { input ->
+                input.copyTo(out, COPY_BUFFER_SIZE)
+            }
+            out.flush()
+            return
+        }
 
         // Stream normal segments as they arrive. Buffering an entire segment before
         // writing it makes the player stall and causes visible HLS frame glitches.
@@ -271,9 +303,10 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
         contentLength: Long,
         range: IntRange? = null,
         totalLength: Long? = null,
+        preserveRangeHeaders: Boolean = false,
     ) {
         out.write("HTTP/1.1 $status ${if (status == 206) "Partial Content" else response.message}\r\n".toByteArray())
-        writeForwardedHeaders(out, response, isM3u8 = false)
+        writeForwardedHeaders(out, response, isM3u8 = false, preserveRangeHeaders = preserveRangeHeaders)
         if (range != null && totalLength != null) {
             out.write("Accept-Ranges: bytes\r\n".toByteArray())
             out.write("Content-Range: bytes ${range.first}-${range.last}/$totalLength\r\n".toByteArray())
@@ -314,6 +347,7 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
         out: java.io.OutputStream,
         response: Response,
         isM3u8: Boolean,
+        preserveRangeHeaders: Boolean = false,
     ) {
         val headers = response.headers
         for (i in 0 until headers.size) {
@@ -323,13 +357,27 @@ class LocalProxy(private val client: okhttp3.OkHttpClient) {
                 name.equals("Transfer-Encoding", ignoreCase = true) ||
                 name.equals("Content-Type", ignoreCase = true) ||
                 name.equals("Content-Length", ignoreCase = true) ||
-                (!isM3u8 && name.equals("Content-Range", ignoreCase = true)) ||
-                (!isM3u8 && name.equals("Accept-Ranges", ignoreCase = true))
+                (!isM3u8 && !preserveRangeHeaders && name.equals("Content-Range", ignoreCase = true)) ||
+                (!isM3u8 && !preserveRangeHeaders && name.equals("Accept-Ranges", ignoreCase = true))
             ) {
                 continue
             }
             out.write("$name: $value\r\n".toByteArray())
         }
+    }
+
+    private fun isPngResponse(response: Response): Boolean {
+        if (response.header("Content-Type")?.contains("image/png", ignoreCase = true) == true) {
+            return true
+        }
+        return runCatching {
+            val prefix = response.peekBody(8).bytes()
+            prefix.size >= 4 &&
+                prefix[0] == (-119).toByte() &&
+                prefix[1] == 80.toByte() &&
+                prefix[2] == 78.toByte() &&
+                prefix[3] == 71.toByte()
+        }.getOrDefault(false)
     }
 
     private fun parseRange(rangeHeader: String?, size: Int): IntRange? {
