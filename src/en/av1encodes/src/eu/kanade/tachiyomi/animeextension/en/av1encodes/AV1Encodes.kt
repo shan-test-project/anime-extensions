@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.animeextension.en.av1encodes
 import android.net.Uri
 import android.util.Log
 import androidx.preference.PreferenceScreen
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -19,9 +20,6 @@ import keiyoushi.utils.parallelCatchingFlatMapBlocking
 import keiyoushi.utils.parallelMapNotNullBlocking
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.useAsJsoup
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import okhttp3.Dispatcher
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -43,6 +41,8 @@ class AV1Encodes :
     override val supportsLatest = true
 
     private val preferences by getPreferencesLazy()
+
+    private val m3u8ServerManager by lazy { M3u8ServerManager(client) }
 
     override val baseUrl: String
         get() = preferences.getString(PREF_DOMAIN_KEY, PREF_DOMAIN_DEFAULT)!!
@@ -456,13 +456,14 @@ class AV1Encodes :
                 episodeNumberRegex
                     .find(link.attr("href"))?.groupValues?.get(1)?.toIntOrNull() ?: 0
             }.map { link ->
-                val fullHref = link.attr("href")
+                val fullHref = link.attr("abs:href").ifBlank { link.attr("href") }
+                val episodePath = normalizePath(fullHref)
                 Log.d(TAG, "episodeListParse: episode link → $fullHref")
 
-                val filename = Uri.decode(fullHref.substringAfterLast("/").substringBefore("?"))
+                val filename = Uri.decode(episodePath.substringAfterLast("/").substringBefore("?"))
 
                 SEpisode.create().apply {
-                    setUrlWithoutDomain(fullHref)
+                    setUrlWithoutDomain(episodePath)
                     name = buildEpisodeLabel(filename, season)
                     episode_number = parseEpisodeNumber(filename)
                 }
@@ -482,7 +483,7 @@ class AV1Encodes :
         val filename = Uri.decode(encodedFilename)
         Log.d(TAG, "getVideoList: filename=$filename")
 
-        val downloadPageUrl = baseUrl + episodeUrl
+        val downloadPageUrl = resolveUrl(episodeUrl) ?: return fallbackDirectUrl(episodeUrl, filename)
 
         Log.d(TAG, "getVideoList: fetching download page → $downloadPageUrl")
         val pageHtml = try {
@@ -495,15 +496,14 @@ class AV1Encodes :
             return fallbackDirectUrl(episodeUrl, filename)
         }
 
-        val ddlToken = Regex("""['"](A{4,}[A-Za-z0-9_\-]{10,})['"]""").find(pageHtml)
-            ?.groupValues?.get(1)
+        val ddlToken = extractDdlToken(pageHtml)
             ?: run {
                 Log.w(TAG, "getVideoList: no ddl-token found in page, falling back")
                 return fallbackDirectUrl(episodeUrl, filename)
             }
-        Log.d(TAG, "getVideoList: ddlToken=$ddlToken")
+        Log.d(TAG, "getVideoList: ddl-token found")
 
-        val ddlUrl = "$baseUrl/get_ddl/$encodedFilename"
+        val ddlUrl = buildDdlUrl(encodedFilename, episodeUrl)
         Log.d(TAG, "getVideoList: calling get_ddl → $ddlUrl")
         val ddlRaw = try {
             client.newCall(
@@ -513,6 +513,7 @@ class AV1Encodes :
                         .set("Accept", "application/json")
                         .set("Referer", downloadPageUrl)
                         .set("X-Ddl-Token", ddlToken)
+                        .set("X-Requested-With", "XMLHttpRequest")
                         .build(),
                 ),
             ).awaitSuccess()
@@ -521,8 +522,6 @@ class AV1Encodes :
             Log.e(TAG, "getVideoList: get_ddl failed — ${e.message}")
             return fallbackDirectUrl(episodeUrl, filename)
         }
-        Log.d(TAG, "getVideoList: get_ddl response=$ddlRaw")
-
         val ddl = try {
             ddlRaw.parseAs<DdlResponse>()
         } catch (e: Exception) {
@@ -542,68 +541,39 @@ class AV1Encodes :
         val audioSuffix = if (audioTag.isNotBlank()) " [$audioTag]" else ""
         val sizeLabel = ddl.fileSize?.let { " · $it" } ?: ""
         val qualLabel = "AV1 · $resLabel$audioSuffix$sizeLabel"
-
-        suspend fun resolveRedirect(path: String?): String? {
-            if (path.isNullOrBlank()) return null
-            val url = if (path.startsWith("/")) "$baseUrl$path" else path
-            return try {
-                // A GET here can make the source wait for a large media response before
-                // the video list is returned. HEAD follows the same redirects without
-                // downloading the file, so the player can start immediately.
-                val finalUrl = client.newCall(
-                    Request.Builder()
-                        .url(url)
-                        .headers(headers.newBuilder().set("Referer", "$baseUrl/").build())
-                        .head()
-                        .build(),
-                )
-                    .awaitSuccess().use { resp ->
-                        resp.request.url.toString()
-                    }
-                Log.d(TAG, "getVideoList: redirect $path → $finalUrl")
-                finalUrl
-            } catch (e: Exception) {
-                // Some file hosts reject HEAD. The original URL is still usable
-                // because the player follows redirects itself.
-                Log.w(TAG, "getVideoList: HEAD failed for $path, using original URL — ${e.message}")
-                url
-            }
-        }
-
-        val (watchUrl, streamUrl, dlUrl, torrentUrl) = coroutineScope {
-            listOf(
-                async { resolveRedirect(ddl.watchLink) },
-                async { resolveRedirect(ddl.streamLink) },
-                async { resolveRedirect(ddl.downloadLink) },
-                async {
-                    if (preferences.getBoolean(PREF_SHOW_TORRENT_KEY, PREF_SHOW_TORRENT_DEFAULT)) {
-                        resolveRedirect(ddl.torrentLink)
-                    } else {
-                        null
-                    }
-                },
-            ).awaitAll()
+        val mediaHeaders = headers.newBuilder()
+            .set("Referer", downloadPageUrl)
+            .set("Origin", baseUrl)
+            .build()
+        val watchUrl = resolveUrl(ddl.watchLink)
+        val streamUrl = resolveUrl(ddl.streamLink)
+        val dlUrl = resolveUrl(ddl.downloadLink)
+        val torrentUrl = if (preferences.getBoolean(PREF_SHOW_TORRENT_KEY, PREF_SHOW_TORRENT_DEFAULT)) {
+            resolveUrl(ddl.torrentLink)
+        } else {
+            null
         }
 
         val mpdUrl = watchUrl?.let(::buildDashManifestUrl)
         if (mpdUrl != null) {
             Log.d(TAG, "getVideoList: DASH MPD → $mpdUrl")
-            videos.add(Video(mpdUrl, "$qualLabel · DASH", mpdUrl))
+            videos.add(Video(mpdUrl, "$qualLabel · DASH", mpdUrl, headers = mediaHeaders))
         }
 
         if (streamUrl != null && streamUrl != watchUrl) {
-            Log.d(TAG, "getVideoList: stream URL → $streamUrl")
-            videos.add(Video(streamUrl, "$qualLabel · Stream", streamUrl))
+            val playbackUrl = proxyHlsUrl(streamUrl, mediaHeaders)
+            Log.d(TAG, "getVideoList: stream URL → $playbackUrl")
+            videos.add(Video(playbackUrl, "$qualLabel · Stream", playbackUrl, headers = mediaHeaders))
         }
 
         if (dlUrl != null) {
             Log.d(TAG, "getVideoList: download URL → $dlUrl")
-            videos.add(Video(dlUrl, "$qualLabel · Direct DL", dlUrl))
+            videos.add(Video(dlUrl, "$qualLabel · Direct DL", dlUrl, headers = mediaHeaders))
         }
 
         if (torrentUrl != null) {
             Log.d(TAG, "getVideoList: torrent URL → $torrentUrl")
-            videos.add(Video(torrentUrl, "$qualLabel · Torrent", torrentUrl))
+            videos.add(Video(torrentUrl, "$qualLabel · Torrent", torrentUrl, headers = mediaHeaders))
         }
 
         if (videos.isEmpty()) {
@@ -647,14 +617,67 @@ class AV1Encodes :
         }.getOrNull()
     }
 
+    private fun resolveUrl(path: String?): String? {
+        if (path.isNullOrBlank()) return null
+        return runCatching {
+            baseUrl.toHttpUrl().resolve(path)?.toString()
+        }.getOrNull()
+    }
+
+    private fun buildDdlUrl(encodedFilename: String, episodeUrl: String): String {
+        val query = episodeUrl.substringAfter('?', "").takeIf { it.isNotBlank() }
+        return buildString {
+            append(baseUrl)
+            append("/get_ddl/")
+            append(encodedFilename)
+            if (query != null) {
+                append('?')
+                append(query)
+            }
+        }
+    }
+
+    private fun extractDdlToken(html: String): String? {
+        val namedToken = Regex(
+            """(?i)(?:ddl[-_]?token|x[-_]?ddl[-_]?token)\s*["']?\s*[:=]\s*["']([A-Za-z0-9_-]{16,})["']""",
+        ).find(html)?.groupValues?.getOrNull(1)
+        if (!namedToken.isNullOrBlank()) return namedToken
+
+        return Regex("""['"]([A-Za-z0-9_-]{24,})['"]""")
+            .findAll(html)
+            .map { it.groupValues[1] }
+            .firstOrNull { it.any(Char::isDigit) && it.any(Char::isUpperCase) }
+    }
+
+    private fun proxyHlsUrl(url: String, mediaHeaders: Headers): String {
+        if (!url.substringBefore('?').endsWith(".m3u8", ignoreCase = true)) return url
+        return runCatching {
+            if (!m3u8ServerManager.isRunning()) m3u8ServerManager.startServer()
+            m3u8ServerManager.processM3u8Url(
+                m3u8Url = url,
+                referer = mediaHeaders["Referer"],
+                userAgent = mediaHeaders["User-Agent"],
+            ) ?: url
+        }.onFailure {
+            Log.w(TAG, "getVideoList: local HLS proxy unavailable, using upstream URL", it)
+        }.getOrDefault(url)
+    }
+
     private fun fallbackDirectUrl(episodeUrl: String, filename: String): List<Video> {
-        val fullUrl = baseUrl + episodeUrl
+        val fullUrl = resolveUrl(episodeUrl) ?: "$baseUrl$episodeUrl"
         val resLabel = Regex("""\[(\d+p)]""").find(filename)?.groupValues?.get(1) ?: prefQuality
         val audioTag = Regex("""\[(Dual|Sub|Dub)]""", RegexOption.IGNORE_CASE)
             .find(filename)?.groupValues?.get(1) ?: ""
         val label = "AV1 · $resLabel${if (audioTag.isNotBlank()) " [$audioTag]" else ""} · Direct DL"
         Log.d(TAG, "getVideoList: fallback URL → $fullUrl")
-        return listOf(Video(fullUrl, label, fullUrl))
+        return listOf(
+            Video(
+                fullUrl,
+                label,
+                fullUrl,
+                headers = headers.newBuilder().set("Referer", "$baseUrl/").build(),
+            ),
+        )
     }
 
     // ══════════════════════════════════════════════════════════════════════════
