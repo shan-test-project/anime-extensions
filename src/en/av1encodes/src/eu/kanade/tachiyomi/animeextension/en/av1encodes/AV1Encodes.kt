@@ -588,7 +588,7 @@ class AV1Encodes :
                         (candidateResolution != null && candidateResolution < preferredResolution)
                 }
             }
-        return listOf(value, compact, resolutionPath) + lowerQualityValues
+        return (listOf(value, compact, resolutionPath) + lowerQualityValues)
             .filterNotNull()
             .filter { it.isNotBlank() }
             .distinct()
