@@ -585,7 +585,7 @@ class AV1Encodes :
                     .find(candidate)?.groupValues?.get(1)?.toIntOrNull()
                 candidate.takeIf {
                     preferredResolution == null ||
-                        candidateResolution != null && candidateResolution < preferredResolution
+                        (candidateResolution != null && candidateResolution < preferredResolution)
                 }
             }
         return listOf(value, compact, resolutionPath) + lowerQualityValues
