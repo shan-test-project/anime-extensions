@@ -14,7 +14,9 @@ internal val DOMAIN_VALUES = arrayOf("https://av1encodes.com", "https://av1pleas
 internal const val PREF_QUALITY_KEY = "preferred_quality"
 internal val QUALITY_ENTRIES = arrayOf("1080p", "720p", "480p", "360p")
 internal val QUALITY_VALUES = arrayOf("1920 x 1080", "1280 x 720", "854 x 480", "640 x 360")
-internal val PREF_QUALITY_DEFAULT = QUALITY_VALUES.first()
+// Start new installs at a bandwidth-friendly quality. Users can still select
+// any higher resolution from the existing preference.
+internal val PREF_QUALITY_DEFAULT = QUALITY_VALUES[2]
 
 internal const val PREF_LINK_TYPE_KEY = "preferred_link_type"
 internal const val PREF_LINK_TYPE_DEFAULT = "Stream"

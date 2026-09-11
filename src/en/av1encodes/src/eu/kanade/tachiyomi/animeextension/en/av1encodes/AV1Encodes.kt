@@ -31,6 +31,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 class AV1Encodes :
     AnimeHttpSource(),
@@ -43,6 +44,7 @@ class AV1Encodes :
     private val preferences by getPreferencesLazy()
 
     private val m3u8ServerManager by lazy { M3u8ServerManager(client) }
+    private val episodeDdlCache = ConcurrentHashMap<String, DdlResponse>()
 
     override val baseUrl: String
         get() = preferences.getString(PREF_DOMAIN_KEY, PREF_DOMAIN_DEFAULT)!!
@@ -484,54 +486,35 @@ class AV1Encodes :
         Log.d(TAG, "getVideoList: filename=$filename")
 
         val downloadPageUrl = resolveUrl(episodeUrl) ?: return fallbackDirectUrl(episodeUrl, filename)
-
-        Log.d(TAG, "getVideoList: fetching download page → $downloadPageUrl")
-        val pageHtml = try {
-            client.newCall(
-                GET(downloadPageUrl, headers.newBuilder().set("Referer", "$baseUrl/").build()),
-            ).awaitSuccess()
-                .bodyString()
-        } catch (e: Exception) {
-            Log.e(TAG, "getVideoList: download page failed — ${e.message}")
-            return fallbackDirectUrl(episodeUrl, filename)
-        }
-
-        val ddlToken = extractDdlToken(pageHtml)
-            ?: run {
-                Log.w(TAG, "getVideoList: no ddl-token found in page, falling back")
+        // Keep successful DDL responses for retries. A player may request the
+        // video list more than once when the first playback attempt fails.
+        val cachedDdl = episodeDdlCache[episodeUrl]
+        val ddl = cachedDdl ?: run {
+            Log.d(TAG, "getVideoList: fetching download page → $downloadPageUrl")
+            val pageHtml = try {
+                client.newCall(
+                    GET(downloadPageUrl, headers.newBuilder().set("Referer", "$baseUrl/").build()),
+                ).awaitSuccess()
+                    .bodyString()
+            } catch (e: Exception) {
+                Log.e(TAG, "getVideoList: download page failed — ${e.message}")
                 return fallbackDirectUrl(episodeUrl, filename)
             }
-        Log.d(TAG, "getVideoList: ddl-token found")
 
-        val ddlUrl = buildDdlUrl(encodedFilename, episodeUrl)
-        Log.d(TAG, "getVideoList: calling get_ddl → $ddlUrl")
-        val ddlRaw = try {
-            client.newCall(
-                GET(
-                    ddlUrl,
-                    headers.newBuilder()
-                        .set("Accept", "application/json")
-                        .set("Referer", downloadPageUrl)
-                        .set("X-Ddl-Token", ddlToken)
-                        .set("X-Requested-With", "XMLHttpRequest")
-                        .build(),
-                ),
-            ).awaitSuccess()
-                .bodyString()
-        } catch (e: Exception) {
-            Log.e(TAG, "getVideoList: get_ddl failed — ${e.message}")
+            val ddlToken = extractDdlToken(pageHtml)
+                ?: run {
+                    Log.w(TAG, "getVideoList: no ddl-token found in page, falling back")
+                    return fallbackDirectUrl(episodeUrl, filename)
+                }
+            Log.d(TAG, "getVideoList: ddl-token found")
+            fetchDdl(encodedFilename, episodeUrl, downloadPageUrl, ddlToken)
+        }
+
+        if (ddl?.success != true) {
+            Log.w(TAG, "getVideoList: DDL response was unavailable or unsuccessful")
             return fallbackDirectUrl(episodeUrl, filename)
         }
-        val ddl = try {
-            ddlRaw.parseAs<DdlResponse>()
-        } catch (e: Exception) {
-            Log.e(TAG, "getVideoList: get_ddl parse failed — ${e.message}")
-            return fallbackDirectUrl(episodeUrl, filename)
-        }
-        if (!ddl.success) {
-            Log.w(TAG, "getVideoList: get_ddl success=false")
-            return fallbackDirectUrl(episodeUrl, filename)
-        }
+        episodeDdlCache[episodeUrl] = ddl
 
         val videos = mutableListOf<Video>()
 
@@ -555,18 +538,18 @@ class AV1Encodes :
         }
 
         val mpdUrl = watchUrl?.let(::buildDashManifestUrl)
-        if (mpdUrl != null) {
+        if (mpdUrl != null && isPlayableCandidate(mpdUrl)) {
             Log.d(TAG, "getVideoList: DASH MPD → $mpdUrl")
             videos.add(Video(mpdUrl, "$qualLabel · DASH", mpdUrl, headers = mediaHeaders))
         }
 
-        if (streamUrl != null && streamUrl != watchUrl) {
+        if (streamUrl != null && streamUrl != watchUrl && isPlayableCandidate(streamUrl)) {
             val playbackUrl = proxyHlsUrl(streamUrl, mediaHeaders)
             Log.d(TAG, "getVideoList: stream URL → $playbackUrl")
             videos.add(Video(playbackUrl, "$qualLabel · Stream", playbackUrl, headers = mediaHeaders))
         }
 
-        if (dlUrl != null) {
+        if (dlUrl != null && isPlayableCandidate(dlUrl)) {
             Log.d(TAG, "getVideoList: download URL → $dlUrl")
             videos.add(Video(dlUrl, "$qualLabel · Direct DL", dlUrl, headers = mediaHeaders))
         }
@@ -578,7 +561,7 @@ class AV1Encodes :
 
         if (videos.isEmpty()) {
             Log.w(TAG, "getVideoList: no videos from get_ddl, falling back")
-            return fallbackDirectUrl(episodeUrl, filename)
+            return emptyList()
         }
 
         Log.d(TAG, "getVideoList: returning ${videos.size} videos")
@@ -595,7 +578,17 @@ class AV1Encodes :
             .find(value)?.groupValues?.get(1)
             ?: Regex("""[xX]\s*(\d{3,4})""").find(value)?.groupValues?.get(1)
         val resolutionPath = resolution?.let { "${it}p" }
-        return listOf(value, compact, resolutionPath)
+        val preferredResolution = resolution?.toIntOrNull()
+        val lowerQualityValues = QUALITY_VALUES
+            .mapNotNull { candidate ->
+                val candidateResolution = Regex("""[xX]\s*(\d{3,4})""")
+                    .find(candidate)?.groupValues?.get(1)?.toIntOrNull()
+                candidate.takeIf {
+                    preferredResolution == null ||
+                        candidateResolution != null && candidateResolution < preferredResolution
+                }
+            }
+        return listOf(value, compact, resolutionPath) + lowerQualityValues
             .filterNotNull()
             .filter { it.isNotBlank() }
             .distinct()
@@ -605,15 +598,48 @@ class AV1Encodes :
     private fun buildDashManifestUrl(watchUrl: String): String? {
         return runCatching {
             val url = watchUrl.toHttpUrl()
+            val path = url.encodedPath.lowercase()
+            if (path.endsWith(".mpd")) return url.toString()
+
+            // watch_link is normally an HTML/player URL. Only derive the
+            // manifest when it follows the server's known /watch/ -> /dash/
+            // layout; arbitrary page URLs must never be offered to a video
+            // player as DASH or they produce intermittent "unsupported format".
             val marker = "/watch/"
             val markerIndex = url.encodedPath.indexOf(marker)
-            if (markerIndex < 0) return null
+            val watchPath = path.substringAfter(marker, "")
+            if (markerIndex < 0 || watchPath.isBlank() || watchPath.contains('/')) return null
             val dashPath = url.encodedPath.replaceRange(
                 markerIndex,
                 markerIndex + marker.length,
                 "/dash/",
             ) + "/manifest.mpd"
             url.newBuilder().encodedPath(dashPath).build().toString()
+        }.getOrNull()
+    }
+
+    private suspend fun fetchDdl(
+        encodedFilename: String,
+        episodeUrl: String,
+        downloadPageUrl: String,
+        ddlToken: String,
+    ): DdlResponse? {
+        val ddlUrl = buildDdlUrl(encodedFilename, episodeUrl)
+        Log.d(TAG, "getVideoList: calling get_ddl")
+        return runCatching {
+            client.newCall(
+                GET(
+                    ddlUrl,
+                    headers.newBuilder()
+                        .set("Accept", "application/json")
+                        .set("Referer", downloadPageUrl)
+                        .set("X-Ddl-Token", ddlToken)
+                        .set("X-Requested-With", "XMLHttpRequest")
+                        .build(),
+                ),
+            ).awaitSuccess().bodyString().parseAs<DdlResponse>()
+        }.onFailure {
+            Log.e(TAG, "getVideoList: get_ddl failed — ${it.message}")
         }.getOrNull()
     }
 
@@ -649,8 +675,23 @@ class AV1Encodes :
             .firstOrNull { it.any(Char::isDigit) && it.any(Char::isUpperCase) }
     }
 
+    private fun isPlayableCandidate(url: String): Boolean {
+        val path = runCatching { url.toHttpUrl().encodedPath.lowercase() }.getOrDefault(url.lowercase())
+        if (path.endsWith(".html") || path.endsWith(".htm") || path.endsWith(".json")) return false
+        if (listOf(".mkv", ".avi", ".flv", ".mov", ".wmv", ".torrent", ".zip").any(path::endsWith)) {
+            return false
+        }
+        // Keep extension-less stream endpoints: several CDNs expose HLS/MP4
+        // through an API route rather than a file extension. Only reject
+        // formats that are known to fail in Android playback.
+        return true
+    }
+
     private fun proxyHlsUrl(url: String, mediaHeaders: Headers): String {
-        if (!url.substringBefore('?').endsWith(".m3u8", ignoreCase = true)) return url
+        val isHls = runCatching {
+            url.toHttpUrl().encodedPath.endsWith(".m3u8", ignoreCase = true)
+        }.getOrDefault(url.contains(".m3u8", ignoreCase = true))
+        if (!isHls) return url
         return runCatching {
             if (!m3u8ServerManager.isRunning()) m3u8ServerManager.startServer()
             m3u8ServerManager.processM3u8Url(
