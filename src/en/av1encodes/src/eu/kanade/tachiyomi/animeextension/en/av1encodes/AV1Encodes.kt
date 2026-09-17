@@ -490,24 +490,8 @@ class AV1Encodes :
         // video list more than once when the first playback attempt fails.
         val cachedDdl = episodeDdlCache[episodeUrl]
         val ddl = cachedDdl ?: run {
-            Log.d(TAG, "getVideoList: fetching download page → $downloadPageUrl")
-            val pageHtml = try {
-                client.newCall(
-                    GET(downloadPageUrl, headers.newBuilder().set("Referer", "$baseUrl/").build()),
-                ).awaitSuccess()
-                    .bodyString()
-            } catch (e: Exception) {
-                Log.e(TAG, "getVideoList: download page failed — ${e.message}")
-                return fallbackDirectUrl(episodeUrl, filename)
-            }
-
-            val ddlToken = extractDdlToken(pageHtml)
-                ?: run {
-                    Log.w(TAG, "getVideoList: no ddl-token found in page, falling back")
-                    return fallbackDirectUrl(episodeUrl, filename)
-                }
-            Log.d(TAG, "getVideoList: ddl-token found")
-            fetchDdl(encodedFilename, episodeUrl, downloadPageUrl, ddlToken)
+            Log.d(TAG, "getVideoList: requesting direct DDL → $encodedFilename")
+            fetchDdl(encodedFilename, downloadPageUrl)
         }
 
         if (ddl?.success != true) {
@@ -528,9 +512,10 @@ class AV1Encodes :
             .set("Referer", downloadPageUrl)
             .set("Origin", baseUrl)
             .build()
+        val directDdlUrl = resolveUrl(ddl.ddl)
         val watchUrl = resolveUrl(ddl.watchLink)
         val streamUrl = resolveUrl(ddl.streamLink)
-        val dlUrl = resolveUrl(ddl.downloadLink)
+        val dlUrl = resolveUrl(ddl.downloadLink) ?: directDdlUrl
         val torrentUrl = if (preferences.getBoolean(PREF_SHOW_TORRENT_KEY, PREF_SHOW_TORRENT_DEFAULT)) {
             resolveUrl(ddl.torrentLink)
         } else {
@@ -618,13 +603,8 @@ class AV1Encodes :
         }.getOrNull()
     }
 
-    private suspend fun fetchDdl(
-        encodedFilename: String,
-        episodeUrl: String,
-        downloadPageUrl: String,
-        ddlToken: String,
-    ): DdlResponse? {
-        val ddlUrl = buildDdlUrl(encodedFilename, episodeUrl)
+    private suspend fun fetchDdl(encodedFilename: String, downloadPageUrl: String): DdlResponse? {
+        val ddlUrl = buildDdlUrl(encodedFilename)
         Log.d(TAG, "getVideoList: calling get_ddl")
         return runCatching {
             client.newCall(
@@ -633,7 +613,6 @@ class AV1Encodes :
                     headers.newBuilder()
                         .set("Accept", "application/json")
                         .set("Referer", downloadPageUrl)
-                        .set("X-Ddl-Token", ddlToken)
                         .set("X-Requested-With", "XMLHttpRequest")
                         .build(),
                 ),
@@ -650,29 +629,8 @@ class AV1Encodes :
         }.getOrNull()
     }
 
-    private fun buildDdlUrl(encodedFilename: String, episodeUrl: String): String {
-        val query = episodeUrl.substringAfter('?', "").takeIf { it.isNotBlank() }
-        return buildString {
-            append(baseUrl)
-            append("/get_ddl/")
-            append(encodedFilename)
-            if (query != null) {
-                append('?')
-                append(query)
-            }
-        }
-    }
-
-    private fun extractDdlToken(html: String): String? {
-        val namedToken = Regex(
-            """(?i)(?:ddl[-_]?token|x[-_]?ddl[-_]?token)\s*["']?\s*[:=]\s*["']([A-Za-z0-9_-]{16,})["']""",
-        ).find(html)?.groupValues?.getOrNull(1)
-        if (!namedToken.isNullOrBlank()) return namedToken
-
-        return Regex("""['"]([A-Za-z0-9_-]{24,})['"]""")
-            .findAll(html)
-            .map { it.groupValues[1] }
-            .firstOrNull { it.any(Char::isDigit) && it.any(Char::isUpperCase) }
+    private fun buildDdlUrl(encodedFilename: String): String {
+        return "$baseUrl/get_ddl/$encodedFilename"
     }
 
     private fun isPlayableCandidate(url: String): Boolean {
