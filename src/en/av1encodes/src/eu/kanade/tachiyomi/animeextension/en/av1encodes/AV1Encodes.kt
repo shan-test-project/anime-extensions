@@ -443,11 +443,17 @@ class AV1Encodes :
             if (downloadLinks.isEmpty()) {
                 Log.w(TAG, "episodeListParse: no <a> links found, falling back to regex on raw HTML")
                 val filenames = extractFilenames(epHtml)
+                val episodeToken = extractEpisodeToken(epHtml)
                 Log.d(TAG, "episodeListParse: regex found ${filenames.size} filenames")
                 return@parallelCatchingFlatMapBlocking filenames.sortedByDescending { parseEpisodeNumber(it) }.map { filename ->
                     val encodedFilename = URLEncoder.encode(filename, "UTF-8").replace("+", "%20")
+                    val tokenQuery = episodeToken?.let {
+                        "?token=${URLEncoder.encode(it, "UTF-8")}"
+                    }.orEmpty()
                     SEpisode.create().apply {
-                        setUrlWithoutDomain("/download/$slug/$season/$selectedResolution/$encodedFilename")
+                        setUrlWithoutDomain(
+                            "/download/$slug/$season/$selectedResolution/$encodedFilename$tokenQuery",
+                        )
                         name = buildEpisodeLabel(filename, season)
                         episode_number = parseEpisodeNumber(filename)
                     }
@@ -481,17 +487,36 @@ class AV1Encodes :
         val episodeUrl = episode.url
         Log.d(TAG, "getVideoList: episode.url=$episodeUrl")
 
-        val encodedFilename = episodeUrl.substringBefore("?").substringAfterLast("/")
+        val downloadPageUrl = resolveUrl(episodeUrl) ?: return fallbackDirectUrl(episodeUrl, "")
+        val episodeHttpUrl = downloadPageUrl.toHttpUrl()
+        val encodedFilename = episodeHttpUrl.encodedPath.substringAfterLast("/")
         val filename = Uri.decode(encodedFilename)
+        val episodeToken = episodeHttpUrl.queryParameter("token")
         Log.d(TAG, "getVideoList: filename=$filename")
+        Log.d(TAG, "getVideoList: signed episode token present=${!episodeToken.isNullOrBlank()}")
 
-        val downloadPageUrl = resolveUrl(episodeUrl) ?: return fallbackDirectUrl(episodeUrl, filename)
+        // The download route carries a signed token in its href. Some versions
+        // of the site also render a separate DDL token in the page, so collect
+        // both before asking for the media links.
+        val pageHtml = runCatching {
+            client.newCall(
+                GET(
+                    downloadPageUrl,
+                    headers.newBuilder().set("Referer", "$baseUrl/").build(),
+                ),
+            ).awaitSuccess().bodyString()
+        }.onFailure {
+            Log.w(TAG, "getVideoList: download page unavailable — ${it.message}")
+        }.getOrDefault("")
+        val ddlToken = extractDdlToken(pageHtml)
+        Log.d(TAG, "getVideoList: page DDL token present=${!ddlToken.isNullOrBlank()}")
+
         // Keep successful DDL responses for retries. A player may request the
         // video list more than once when the first playback attempt fails.
         val cachedDdl = episodeDdlCache[episodeUrl]
         val ddl = cachedDdl ?: run {
-            Log.d(TAG, "getVideoList: requesting direct DDL → $encodedFilename")
-            fetchDdl(encodedFilename, downloadPageUrl)
+            Log.d(TAG, "getVideoList: requesting authenticated DDL → $encodedFilename")
+            fetchDdl(encodedFilename, downloadPageUrl, episodeToken, ddlToken)
         }
 
         if (ddl?.success != true) {
@@ -511,13 +536,16 @@ class AV1Encodes :
         val mediaHeaders = headers.newBuilder()
             .set("Referer", downloadPageUrl)
             .set("Origin", baseUrl)
+            .apply {
+                if (!ddlToken.isNullOrBlank()) set("X-Ddl-Token", ddlToken)
+            }
             .build()
-        val directDdlUrl = resolveUrl(ddl.ddl)
-        val watchUrl = resolveUrl(ddl.watchLink)
-        val streamUrl = resolveUrl(ddl.streamLink)
-        val dlUrl = resolveUrl(ddl.downloadLink) ?: directDdlUrl
+        val directDdlUrl = resolveAuthenticatedUrl(ddl.ddl, episodeToken)
+        val watchUrl = resolveAuthenticatedUrl(ddl.watchLink, episodeToken)
+        val streamUrl = resolveAuthenticatedUrl(ddl.streamLink, episodeToken)
+        val dlUrl = resolveAuthenticatedUrl(ddl.downloadLink, episodeToken) ?: directDdlUrl
         val torrentUrl = if (preferences.getBoolean(PREF_SHOW_TORRENT_KEY, PREF_SHOW_TORRENT_DEFAULT)) {
-            resolveUrl(ddl.torrentLink)
+            resolveAuthenticatedUrl(ddl.torrentLink, episodeToken)
         } else {
             null
         }
@@ -534,7 +562,7 @@ class AV1Encodes :
             videos.add(Video(playbackUrl, "$qualLabel · Stream", playbackUrl, headers = mediaHeaders))
         }
 
-        if (dlUrl != null && isPlayableCandidate(dlUrl)) {
+        if (dlUrl != null && isMediaOrDownloadCandidate(dlUrl)) {
             Log.d(TAG, "getVideoList: download URL → $dlUrl")
             videos.add(Video(dlUrl, "$qualLabel · Direct DL", dlUrl, headers = mediaHeaders))
         }
@@ -603,23 +631,36 @@ class AV1Encodes :
         }.getOrNull()
     }
 
-    private suspend fun fetchDdl(encodedFilename: String, downloadPageUrl: String): DdlResponse? {
-        val ddlUrl = buildDdlUrl(encodedFilename)
-        Log.d(TAG, "getVideoList: calling get_ddl")
-        return runCatching {
-            client.newCall(
-                GET(
-                    ddlUrl,
-                    headers.newBuilder()
-                        .set("Accept", "application/json")
-                        .set("Referer", downloadPageUrl)
-                        .set("X-Requested-With", "XMLHttpRequest")
-                        .build(),
-                ),
-            ).awaitSuccess().bodyString().parseAs<DdlResponse>()
-        }.onFailure {
-            Log.e(TAG, "getVideoList: get_ddl failed — ${it.message}")
-        }.getOrNull()
+    private suspend fun fetchDdl(
+        encodedFilename: String,
+        downloadPageUrl: String,
+        episodeToken: String?,
+        ddlToken: String?,
+    ): DdlResponse? {
+        val tokenizedDdlUrl = buildDdlUrl(encodedFilename).let {
+            attachEpisodeToken(it, episodeToken)
+        }
+        val ddlUrls = listOf(tokenizedDdlUrl, buildDdlUrl(encodedFilename)).distinct()
+        val ddlHeaders = headers.newBuilder()
+            .set("Accept", "application/json")
+            .set("Referer", downloadPageUrl)
+            .set("X-Requested-With", "XMLHttpRequest")
+            .apply {
+                if (!ddlToken.isNullOrBlank()) set("X-Ddl-Token", ddlToken)
+            }
+            .build()
+
+        for (ddlUrl in ddlUrls) {
+            Log.d(TAG, "getVideoList: calling authenticated get_ddl → $ddlUrl")
+            val result = runCatching {
+                client.newCall(GET(ddlUrl, ddlHeaders)).awaitSuccess()
+                    .bodyString().parseAs<DdlResponse>()
+            }.onFailure {
+                Log.w(TAG, "getVideoList: get_ddl failed — ${it.message}")
+            }.getOrNull()
+            if (result?.success == true) return result
+        }
+        return null
     }
 
     private fun resolveUrl(path: String?): String? {
@@ -629,6 +670,22 @@ class AV1Encodes :
         }.getOrNull()
     }
 
+    private fun resolveAuthenticatedUrl(path: String?, episodeToken: String?): String? {
+        return resolveUrl(path)?.let { attachEpisodeToken(it, episodeToken) }
+    }
+
+    private fun attachEpisodeToken(url: String, episodeToken: String?): String {
+        if (episodeToken.isNullOrBlank()) return url
+        return runCatching {
+            val parsed = url.toHttpUrl()
+            if (parsed.queryParameter("token") != null) {
+                parsed.toString()
+            } else {
+                parsed.newBuilder().addQueryParameter("token", episodeToken).build().toString()
+            }
+        }.getOrDefault(url)
+    }
+
     private fun buildDdlUrl(encodedFilename: String): String {
         return "$baseUrl/get_ddl/$encodedFilename"
     }
@@ -636,13 +693,19 @@ class AV1Encodes :
     private fun isPlayableCandidate(url: String): Boolean {
         val path = runCatching { url.toHttpUrl().encodedPath.lowercase() }.getOrDefault(url.lowercase())
         if (path.endsWith(".html") || path.endsWith(".htm") || path.endsWith(".json")) return false
-        if (listOf(".mkv", ".avi", ".flv", ".mov", ".wmv", ".torrent", ".zip").any(path::endsWith)) {
+        if (listOf(".torrent", ".zip").any(path::endsWith)) {
             return false
         }
         // Keep extension-less stream endpoints: several CDNs expose HLS/MP4
         // through an API route rather than a file extension. Only reject
         // formats that are known to fail in Android playback.
         return true
+    }
+
+    private fun isMediaOrDownloadCandidate(url: String): Boolean {
+        val path = runCatching { url.toHttpUrl().encodedPath.lowercase() }.getOrDefault(url.lowercase())
+        return !path.endsWith(".html") && !path.endsWith(".htm") && !path.endsWith(".json") &&
+            !path.endsWith(".torrent") && !path.endsWith(".zip")
     }
 
     private fun proxyHlsUrl(url: String, mediaHeaders: Headers): String {
@@ -674,7 +737,7 @@ class AV1Encodes :
                 fullUrl,
                 label,
                 fullUrl,
-                headers = headers.newBuilder().set("Referer", "$baseUrl/").build(),
+                headers = headers.newBuilder().set("Referer", fullUrl).build(),
             ),
         )
     }
@@ -696,6 +759,43 @@ class AV1Encodes :
         filenameRegex
             .findAll(html).forEach { addDecoded(it.groupValues[1]) }
         return filenames.toList()
+    }
+
+    private fun extractEpisodeToken(html: String): String? {
+        Jsoup.parse(html).select("a[href*='/download/']").firstNotNullOfOrNull { link ->
+            resolveUrl(link.attr("href"))
+                ?.toHttpUrl()
+                ?.queryParameter("token")
+        }?.takeIf { it.isNotBlank() }?.let { return it }
+
+        return Regex("""(?i)[?&]token=([^"'&\s]+)""")
+            .find(html)?.groupValues?.getOrNull(1)
+    }
+
+    private fun extractDdlToken(html: String): String? {
+        if (html.isBlank()) return null
+
+        val document = Jsoup.parse(html)
+        val attributeToken = document.select(
+            "[data-ddl-token], [data-token], input[name=ddl-token], input[name=token]",
+        ).firstNotNullOfOrNull { element ->
+            listOf("data-ddl-token", "data-token", "value")
+                .firstNotNullOfOrNull { attribute ->
+                    element.attr(attribute).trim().takeIf { it.length >= 10 }
+                }
+        }
+        if (attributeToken != null) return attributeToken
+
+        val namedTokenRegex = Regex(
+            """(?i)(?:ddl[-_ ]?token|auth(?:entication)?[-_ ]?token)\s*["']?\s*[:=]\s*["']([^"']+)["']""",
+        )
+        namedTokenRegex.find(html)?.groupValues?.getOrNull(1)?.let {
+            if (it.length >= 10) return it
+        }
+
+        // Older pages exposed the DDL token as a standalone A-prefixed value.
+        return Regex("""['"](A{4,}[A-Za-z0-9_-]{10,})['"]""")
+            .find(html)?.groupValues?.getOrNull(1)
     }
 
     private val episodeNameRegex by lazy { Regex("""\[(?:S\d+-)?E(\d+)]\s*(.+?)\s*\[""") }
