@@ -7,6 +7,8 @@ import kotlinx.serialization.Serializable
 @Serializable
 internal data class DdlResponse(
     @SerialName("success") val success: Boolean = false,
+    // The current site response uses this compact direct-download field.
+    @SerialName("ddl") val ddl: String? = null,
     @SerialName("stream_link") val streamLink: String? = null,
     @SerialName("download_link") val downloadLink: String? = null,
     @SerialName("torrent_link") val torrentLink: String? = null,
