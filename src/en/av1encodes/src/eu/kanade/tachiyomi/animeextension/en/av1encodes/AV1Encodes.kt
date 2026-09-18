@@ -572,21 +572,23 @@ class AV1Encodes :
             }.getOrNull()
         }
 
-        val (watchUrl, streamUrl, dlUrl, torrentUrl) = coroutineScope {
+        val (watchUrl, streamUrl, dlUrl) = coroutineScope {
             val watch = async { resolveRedirect(ddl.watchLink) }
             val stream = async { resolveRedirect(ddl.streamLink) }
             val directDownload = async { resolveRedirect(ddl.downloadLink ?: ddl.ddl) }
-            val torrent = if (preferences.getBoolean(PREF_SHOW_TORRENT_KEY, PREF_SHOW_TORRENT_DEFAULT)) {
-                async { resolveRedirect(ddl.torrentLink) }
-            } else {
-                null
-            }
             listOf(
                 watch.await(),
                 stream.await(),
                 directDownload.await(),
-                torrent?.await(),
             )
+        }
+        // Keep Torrent available without making it part of initial playback
+        // latency. It is a download target, so the player does not need its
+        // redirect resolved before DASH/Stream/Direct DL can be shown.
+        val torrentUrl = if (preferences.getBoolean(PREF_SHOW_TORRENT_KEY, PREF_SHOW_TORRENT_DEFAULT)) {
+            resolveUrl(ddl.torrentLink)
+        } else {
+            null
         }
 
         val mpdUrl = watchUrl?.let(::buildDashManifestUrl)
@@ -596,7 +598,15 @@ class AV1Encodes :
         }
 
         if (streamUrl != null && streamUrl != watchUrl && isPlayableCandidate(streamUrl)) {
-            val playbackUrl = proxyHlsUrl(streamUrl, mediaHeaders)
+            // Match the fast PR path: do not start/fetch through the local HLS
+            // proxy while constructing the video list. If the proxy is already
+            // warm, retain it for compatibility; otherwise hand ExoPlayer the
+            // resolved upstream stream directly.
+            val playbackUrl = if (m3u8ServerManager.isRunning()) {
+                proxyHlsUrl(streamUrl, mediaHeaders)
+            } else {
+                streamUrl
+            }
             Log.d(TAG, "getVideoList: stream URL → $playbackUrl")
             videos.add(Video(playbackUrl, "$qualLabel · Stream", playbackUrl, headers = mediaHeaders))
         }
