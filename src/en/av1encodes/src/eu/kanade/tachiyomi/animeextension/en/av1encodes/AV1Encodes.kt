@@ -20,6 +20,8 @@ import keiyoushi.utils.parallelCatchingFlatMapBlocking
 import keiyoushi.utils.parallelMapNotNullBlocking
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.useAsJsoup
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import okhttp3.Dispatcher
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -570,13 +572,21 @@ class AV1Encodes :
             }.getOrNull()
         }
 
-        val watchUrl = resolveRedirect(ddl.watchLink)
-        val streamUrl = resolveRedirect(ddl.streamLink)
-        val dlUrl = resolveRedirect(ddl.downloadLink ?: ddl.ddl)
-        val torrentUrl = if (preferences.getBoolean(PREF_SHOW_TORRENT_KEY, PREF_SHOW_TORRENT_DEFAULT)) {
-            resolveRedirect(ddl.torrentLink)
-        } else {
-            null
+        val (watchUrl, streamUrl, dlUrl, torrentUrl) = coroutineScope {
+            val watch = async { resolveRedirect(ddl.watchLink) }
+            val stream = async { resolveRedirect(ddl.streamLink) }
+            val directDownload = async { resolveRedirect(ddl.downloadLink ?: ddl.ddl) }
+            val torrent = if (preferences.getBoolean(PREF_SHOW_TORRENT_KEY, PREF_SHOW_TORRENT_DEFAULT)) {
+                async { resolveRedirect(ddl.torrentLink) }
+            } else {
+                null
+            }
+            listOf(
+                watch.await(),
+                stream.await(),
+                directDownload.await(),
+                torrent?.await(),
+            )
         }
 
         val mpdUrl = watchUrl?.let(::buildDashManifestUrl)
