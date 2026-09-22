@@ -1,3 +1,4 @@
+@file:Suppress("ktlint:standard:filename")
 package eu.kanade.tachiyomi.animeextension.en.anipm
 
 import aniyomi.lib.universalextractor.UniversalExtractor
