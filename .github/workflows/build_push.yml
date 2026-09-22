@@ -86,8 +86,8 @@ jobs:
           if [ "${{ github.repository }}" = "yuzono/anime-extensions" ]; then
             python ./.github/scripts/generate-build-matrices.py "$NX_BASE" Debug
           else
-            echo 'matrix={"chunk":[{"number":1,"modules":[":src:en:av1encodes:assembleDebug"]}]}' >> "$GITHUB_OUTPUT"
-            echo 'delete=["en.av1encodes"]' >> "$GITHUB_OUTPUT"
+            echo 'matrix={"chunk":[{"number":1,"modules":[":src:en:anipm:assembleDebug"]}]}' >> "$GITHUB_OUTPUT"
+            echo 'delete=[]' >> "$GITHUB_OUTPUT"
           fi
 
   build:
@@ -117,7 +117,7 @@ jobs:
           cache-read-only: ${{ matrix.chunk.number > 1 }}
 
       - name: Apply Spotless formatting
-        run: ./gradlew :src:en:av1encodes:spotlessApply
+        run: ./gradlew :src:en:anipm:spotlessApply
 
       - name: Build extensions (${{ matrix.chunk.number }})
         env:
