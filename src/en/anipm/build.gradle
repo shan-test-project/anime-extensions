@@ -1,0 +1,12 @@
+ext {
+    extName = 'Ani.pm'
+    extClass = '.AniPm'
+    baseUrl = 'https://ani.pm'
+    extVersionCode = 1
+}
+
+apply plugin: "kei.plugins.extension.legacy"
+
+dependencies {
+    implementation(project(":lib:universalextractor"))
+}
