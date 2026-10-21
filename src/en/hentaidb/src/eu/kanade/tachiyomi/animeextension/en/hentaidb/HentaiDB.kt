@@ -190,8 +190,8 @@ class HentaiDB : Source() {
                 (facts["Episodes"] ?: entry?.row?.e?.toString())?.let { append("Episodes: ").append(it).append('\n') }
                 entry?.runtime?.takeIf { it > 0 }?.let { append("Total runtime: ").append(formatDuration(it)).append('\n') }
                 (facts["Best copy"] ?: entry?.row?.q?.takeIf { it > 0 }?.let { "${it}p" })?.let { append("Best copy: ").append(it).append('\n') }
-                (facts["Cut"] ?: entry?.row?.c?.let { if (it == 1) "Censored" else if (it == 2) "Uncensored" else null })
-                    ?.let { append("Cut: ").append(it).append('\n') }
+                val cut = facts["Cut"] ?: entry?.row?.c?.let(::cutLabel)
+                cut?.let { append("Cut: ").append(it).append('\n') }
                 facts["Subtitles"]?.let { append("Subtitles: ").append(it).append('\n') }
                 if (entry?.row?.dub == 1) append("English dub available\n")
             }.trim()
@@ -402,6 +402,12 @@ class HentaiDB : Source() {
         val h = seconds / 3600
         val m = (seconds % 3600 + 30) / 60
         return if (h > 0) "$h h $m min" else "$m min"
+    }
+
+    private fun cutLabel(cut: Int): String? = when (cut) {
+        1 -> "Censored"
+        2 -> "Uncensored"
+        else -> null
     }
 
     private fun formatNumber(number: Float): String = if (number % 1f == 0f) number.toInt().toString() else number.toString()

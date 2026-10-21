@@ -18,11 +18,9 @@ object HentaiDBFilters {
         Triple("Studio", "studio", true),
     )
 
-    class SortFilter(state: Selection = Selection(0, false)) :
-        AnimeFilter.Sort("Sort by", SORTS.map { it.first }.toTypedArray(), state)
+    class SortFilter(state: Selection = Selection(0, false)) : AnimeFilter.Sort("Sort by", SORTS.map { it.first }.toTypedArray(), state)
 
-    open class ValueSelect(name: String, private val options: List<Pair<String, String>>) :
-        AnimeFilter.Select<String>(name, options.map { it.first }.toTypedArray()) {
+    open class ValueSelect(name: String, private val options: List<Pair<String, String>>) : AnimeFilter.Select<String>(name, options.map { it.first }.toTypedArray()) {
         val selected: String get() = options.getOrNull(state)?.second.orEmpty()
     }
 
