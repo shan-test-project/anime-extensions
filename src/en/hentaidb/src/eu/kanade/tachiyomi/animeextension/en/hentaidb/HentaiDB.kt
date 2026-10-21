@@ -122,7 +122,7 @@ class HentaiDB : Source() {
             return AnimesPage(listOfNotNull(entry?.toSAnime()), false)
         }
 
-        val words = trimmed.replace("\"", " ").split(WHITESPACE_REGEX).filter(String::isNotEmpty)
+        val words = HentaiDBCatalog.searchTerms(trimmed.replace("\"", " "))
         val catalogQuery = HentaiDBFilters.buildQuery(words, filters, catalog)
         return catalog.page(catalog.search(catalogQuery), page)
     }
@@ -216,7 +216,7 @@ class HentaiDB : Source() {
                     ?: number?.let { "Episode ${formatNumber(it)}" }
                     ?: "Episode"
                 val details = listOfNotNull(li.selectFirst(".ep-d")?.text()?.ifEmpty { null }) + li.select(".ep-m b").eachText()
-                scanlator = details.joinToString(" • ").ifEmpty { null }
+                scanlator = details.joinToString(" â¢ ").ifEmpty { null }
                 preview_url = li.selectFirst(".still img")?.absUrl("src")?.ifEmpty { null }
             }
         }.orEmpty().distinctBy { it.url }
@@ -274,7 +274,7 @@ class HentaiDB : Source() {
             q?.ifEmpty { null } ?: resolution?.let { "${it}p" },
             codecLabel(c),
             sz?.takeIf { it > 0 }?.let(::formatSize),
-        ).joinToString(" • ").ifEmpty { "Video" }
+        ).joinToString(" â¢ ").ifEmpty { "Video" }
         val bitrate = if (sz != null && d != null && d > 0) (sz * 8 / d).coerceAtMost(Int.MAX_VALUE.toLong()).toInt() else null
 
         return Video(
@@ -421,7 +421,6 @@ class HentaiDB : Source() {
 
         private val CATALOG_PATH_REGEX = Regex("""(/cat-[\w-]+\.js)""")
         private val RESOLUTION_REGEX = Regex("""(\d{3,4})p""")
-        private val WHITESPACE_REGEX = Regex("""\s+""")
 
         private const val PREF_QUALITY_KEY = "preferred_quality"
         private const val PREF_QUALITY_DEFAULT = "1080"

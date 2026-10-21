@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.en.hentaidb
 
 import java.text.Collator
+import java.text.Normalizer
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
@@ -29,9 +30,7 @@ class HentaiDBCatalog(dto: CatalogDto) {
     /** Display studio name -> number of titles. */
     private val studioCounts = HashMap<String, Int>()
 
-    private val tagWords: List<List<String>> = tags.map { tag ->
-        tag.lowercase(Locale.ROOT).split(NON_ALNUM_REGEX).filter(String::isNotEmpty)
-    }
+    private val tagWords: List<List<String>> = tags.map { searchTerms(it) }
 
     private val tagIndex: Map<String, Int> = tags.withIndex().associate { it.value to it.index }
 
@@ -103,7 +102,7 @@ class HentaiDBCatalog(dto: CatalogDto) {
     // ============================== Querying ==============================
 
     fun search(query: Query): List<Entry> {
-        val words = query.words.map { it.lowercase(Locale.ROOT) }.filter(String::isNotEmpty)
+        val words = query.words.flatMap { searchTerms(it) }
         val ordered = order(query.sort, query.reversed)
         if (words.isEmpty()) return ordered.filter { matches(it, query) }
 
@@ -148,19 +147,15 @@ class HentaiDBCatalog(dto: CatalogDto) {
         return true
     }
 
-    private fun termScore(r: Entry, t: String): Int {
-        val title = r.titleLower
-        val i = title.indexOf(t)
-        return when {
-            title == t -> 100
-            i == 0 -> 70
-            title.contains(" $t") -> 50
-            i > 0 -> 35
-            r.studioWords.contains(" $t") -> 25
-            " ${r.row.k}".lowercase(Locale.ROOT).contains(" $t") -> 25
-            r.row.g.any { k -> tagWords.getOrNull(k)?.any { it.startsWith(t) } == true } -> 15
-            else -> 0
-        }
+    private fun termScore(r: Entry, t: String): Int = when {
+        r.titleSearchText == t -> 100
+        r.titleSearchText.startsWith(t) -> 70
+        r.titleWords.any { it.startsWith(t) } -> 50
+        r.titleWords.any { it.contains(t) } -> 35
+        r.studioWords.any { it.startsWith(t) } -> 25
+        r.alternativeTitleWords.any { it.startsWith(t) } -> 25
+        r.row.g.any { k -> tagWords.getOrNull(k)?.any { it.startsWith(t) } == true } -> 15
+        else -> 0
     }
 
     private fun order(sort: String, reversed: Boolean): List<Entry> {
@@ -205,10 +200,10 @@ class HentaiDBCatalog(dto: CatalogDto) {
     class Entry(val row: CatalogRowDto, val studio: String, val tagNames: List<String>) {
         val studioDisplayParts: List<String> = studio.split(STUDIO_SPLIT_REGEX).map(String::trim).filter(String::isNotEmpty)
         val studioParts: List<String> = studioDisplayParts.map { fold(it) }
-        val studioWords: String = studioDisplayParts.joinToString(" ").lowercase(Locale.ROOT).let { joined ->
-            " " + joined.replace(NON_ALNUM_REGEX, " ") + " " + joined
-        }
-        val titleLower: String = row.t.lowercase(Locale.ROOT)
+        val studioWords: List<String> = studioDisplayParts.flatMap { searchTerms(it) }
+        val titleWords: List<String> = searchTerms(row.t)
+        val titleSearchText: String = titleWords.joinToString(" ")
+        val alternativeTitleWords: List<String> = searchTerms(row.k)
         private val known: List<Int> = row.d.filter { it > 0 }.sorted()
         val runtime: Int = if (row.d.isNotEmpty() && known.size == row.d.size) known.sum() else 0
         val median: Double = when {
@@ -241,9 +236,16 @@ class HentaiDBCatalog(dto: CatalogDto) {
         val TYPES = listOf("OVA", "Movie", "TV Series", "Web", "Other")
         val STATUSES = listOf("Completed", "Ongoing", "Stalled")
 
-        private val NON_ALNUM_REGEX = Regex("[^a-z0-9]+")
+        private val SEARCH_SEPARATOR_REGEX = Regex("[^\\p{L}\\p{N}]+")
+        private val DIACRITICS_REGEX = Regex("\\p{M}+")
         private val STUDIO_SPLIT_REGEX = Regex("\\s*,\\s*")
 
-        fun fold(value: String): String = value.lowercase(Locale.ROOT).replace(NON_ALNUM_REGEX, "")
+        fun searchTerms(value: String): List<String> = Normalizer.normalize(value, Normalizer.Form.NFD)
+            .lowercase(Locale.ROOT)
+            .replace(DIACRITICS_REGEX, "")
+            .split(SEARCH_SEPARATOR_REGEX)
+            .filter(String::isNotEmpty)
+
+        fun fold(value: String): String = searchTerms(value).joinToString("")
     }
 }
