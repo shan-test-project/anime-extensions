@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.animeextension.en.hentaidb
 
+import android.util.Log
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
@@ -216,7 +217,7 @@ class HentaiDB : Source() {
                     ?: number?.let { "Episode ${formatNumber(it)}" }
                     ?: "Episode"
                 val details = listOfNotNull(li.selectFirst(".ep-d")?.text()?.ifEmpty { null }) + li.select(".ep-m b").eachText()
-                scanlator = details.joinToString(" â¢ ").ifEmpty { null }
+                scanlator = details.joinToString(" Ã¢ÂÂ¢ ").ifEmpty { null }
                 preview_url = li.selectFirst(".still img")?.absUrl("src")?.ifEmpty { null }
             }
         }.orEmpty().distinctBy { it.url }
@@ -239,16 +240,41 @@ class HentaiDB : Source() {
     // ============================ Video Links =============================
 
     override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
-        val html = client.get(getEpisodeUrl(episode), headers).bodyString()
+        val html = try {
+            client.get(getEpisodeUrl(episode), headers).bodyString()
+        } catch (error: Exception) {
+            logEpisodeFailure("page request", error)
+            throw error
+        }
         val json = html.substringAfter("window.EP=", "").substringBefore("</script>").trim().removeSuffix(";")
-        if (json.isEmpty()) throw Exception("No player data found on this episode page")
-        val data = json.parseAs<EpisodeDataDto>()
+        if (json.isEmpty()) {
+            Log.w(LOG_TAG, "Episode page response did not include player data")
+            throw Exception("No player data found on this episode page")
+        }
+        val data = try {
+            json.parseAs<EpisodeDataDto>()
+        } catch (error: Exception) {
+            logEpisodeFailure("player data parsing", error)
+            throw error
+        }
 
         val videoHeaders = headers.newBuilder().set("Accept", "*/*").build()
         val hosters = buildHosters(data, data.src, dub = false, videoHeaders) +
             buildHosters(data, data.dub, dub = true, videoHeaders)
-        if (hosters.isEmpty()) throw Exception("No video sources found")
+        if (hosters.isEmpty()) {
+            Log.w(LOG_TAG, "Episode player data contained no usable video sources")
+            throw Exception("No video sources found")
+        }
         return hosters
+    }
+
+    private fun logEpisodeFailure(stage: String, error: Exception) {
+        val failureType = if (error.message?.contains("Failed to bypass Cloudflare", ignoreCase = true) == true) {
+            "cloudflare interceptor"
+        } else {
+            error.javaClass.simpleName
+        }
+        Log.w(LOG_TAG, "Episode $stage failed ($failureType)")
     }
 
     private fun buildHosters(
@@ -274,7 +300,7 @@ class HentaiDB : Source() {
             q?.ifEmpty { null } ?: resolution?.let { "${it}p" },
             codecLabel(c),
             sz?.takeIf { it > 0 }?.let(::formatSize),
-        ).joinToString(" â¢ ").ifEmpty { "Video" }
+        ).joinToString(" Ã¢ÂÂ¢ ").ifEmpty { "Video" }
         val bitrate = if (sz != null && d != null && d > 0) (sz * 8 / d).coerceAtMost(Int.MAX_VALUE.toLong()).toInt() else null
 
         return Video(
@@ -418,6 +444,7 @@ class HentaiDB : Source() {
         private const val PAGE_SIZE = 30
         private const val CATALOG_TTL_MS = 30 * 60 * 1000L
         private const val DUB_SUFFIX = "[Dub]"
+        private const val LOG_TAG = "HentaiDB"
 
         private val CATALOG_PATH_REGEX = Regex("""(/cat-[\w-]+\.js)""")
         private val RESOLUTION_REGEX = Regex("""(\d{3,4})p""")
