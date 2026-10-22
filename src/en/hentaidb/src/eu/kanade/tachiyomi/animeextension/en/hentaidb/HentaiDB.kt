@@ -35,6 +35,45 @@ class HentaiDB : Source() {
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .set("Referer", "$baseUrl/")
 
+    // The site's origin answers any request that lacks browser `Sec-Fetch-*` metadata with a bare
+    // `403 Forbidden` unless Cloudflare already has the page cached. The app's Cloudflare interceptor
+    // treats every 403 from a Cloudflare server as a challenge, opens a WebView (which sends the
+    // headers, so Cloudflare caches the page for about a minute), finds no `cf_clearance` cookie and
+    // fails with "Failed to bypass Cloudflare". That is why an episode only played on the 2nd or 3rd try.
+    // Sending the same headers a browser sends avoids the 403 altogether.
+
+    /** Headers for HTML documents (home, series and watch pages). */
+    private val pageHeaders: Headers by lazy {
+        headers.newBuilder()
+            .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .set("Sec-Fetch-Dest", "document")
+            .set("Sec-Fetch-Mode", "navigate")
+            .set("Sec-Fetch-Site", "same-origin")
+            .set("Sec-Fetch-User", "?1")
+            .set("Upgrade-Insecure-Requests", "1")
+            .build()
+    }
+
+    /** Headers for the catalog script, fetched the way the page's `<script>` tag would. */
+    private val scriptHeaders: Headers by lazy {
+        headers.newBuilder()
+            .set("Accept", "*/*")
+            .set("Sec-Fetch-Dest", "script")
+            .set("Sec-Fetch-Mode", "no-cors")
+            .set("Sec-Fetch-Site", "same-origin")
+            .build()
+    }
+
+    /** Headers the player uses for video files. */
+    private val videoHeaders: Headers by lazy {
+        headers.newBuilder()
+            .set("Accept", "*/*")
+            .set("Sec-Fetch-Dest", "video")
+            .set("Sec-Fetch-Mode", "no-cors")
+            .set("Sec-Fetch-Site", "same-origin")
+            .build()
+    }
+
     private val prefQuality by preferences.delegate(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT)
     private val prefCodec by preferences.delegate(PREF_CODEC_KEY, PREF_CODEC_DEFAULT)
     private val prefServer by preferences.delegate(PREF_SERVER_KEY, PREF_SERVER_DEFAULT)
@@ -66,10 +105,10 @@ class HentaiDB : Source() {
     }
 
     private suspend fun fetchCatalog(): HentaiDBCatalog {
-        val home = client.get(baseUrl, headers).bodyString()
+        val home = client.get(baseUrl, pageHeaders).bodyString()
         val path = CATALOG_PATH_REGEX.find(home)?.groupValues?.get(1)
             ?: throw Exception("Could not locate the catalog. Open the site in WebView and try again.")
-        val script = client.get(baseUrl + path, headers).bodyString()
+        val script = client.get(baseUrl + path, scriptHeaders).bodyString()
         val json = script.substringAfter("=").trim().removeSuffix(";")
         return HentaiDBCatalog(json.parseAs<CatalogDto>())
     }
@@ -122,8 +161,8 @@ class HentaiDB : Source() {
             return AnimesPage(listOfNotNull(entry?.toSAnime()), false)
         }
 
-        val words = trimmed.replace("\"", " ").split(WHITESPACE_REGEX).filter(String::isNotEmpty)
-        val catalogQuery = HentaiDBFilters.buildQuery(words, filters, catalog)
+        // Parse the text exactly like the site's search box, then apply the filter sheet on top.
+        val catalogQuery = HentaiDBFilters.buildQuery(catalog.parse(trimmed), filters, catalog)
         return catalog.page(catalog.search(catalogQuery), page)
     }
 
@@ -149,7 +188,7 @@ class HentaiDB : Source() {
     private fun SAnime.slug(): String = url.substringAfter("/s/").substringBefore('?').trim('/')
 
     private suspend fun seriesPage(anime: SAnime): Document? = runCatching {
-        client.get(getAnimeUrl(anime), headers).useAsJsoup()
+        client.get(getAnimeUrl(anime), pageHeaders).useAsJsoup()
     }.getOrNull()
 
     override suspend fun getAnimeDetails(anime: SAnime): SAnime {
@@ -190,8 +229,12 @@ class HentaiDB : Source() {
                 (facts["Episodes"] ?: entry?.row?.e?.toString())?.let { append("Episodes: ").append(it).append('\n') }
                 entry?.runtime?.takeIf { it > 0 }?.let { append("Total runtime: ").append(formatDuration(it)).append('\n') }
                 (facts["Best copy"] ?: entry?.row?.q?.takeIf { it > 0 }?.let { "${it}p" })?.let { append("Best copy: ").append(it).append('\n') }
-                (facts["Cut"] ?: entry?.row?.c?.let { if (it == 1) "Censored" else if (it == 2) "Uncensored" else null })
-                    ?.let { append("Cut: ").append(it).append('\n') }
+                val cut = facts["Cut"] ?: when (entry?.row?.c) {
+                    1 -> "Censored"
+                    2 -> "Uncensored"
+                    else -> null
+                }
+                cut?.let { append("Cut: ").append(it).append('\n') }
                 facts["Subtitles"]?.let { append("Subtitles: ").append(it).append('\n') }
                 if (entry?.row?.dub == 1) append("English dub available\n")
             }.trim()
@@ -216,7 +259,7 @@ class HentaiDB : Source() {
                     ?: number?.let { "Episode ${formatNumber(it)}" }
                     ?: "Episode"
                 val details = listOfNotNull(li.selectFirst(".ep-d")?.text()?.ifEmpty { null }) + li.select(".ep-m b").eachText()
-                scanlator = details.joinToString(" • ").ifEmpty { null }
+                scanlator = details.joinToString(SEPARATOR).ifEmpty { null }
                 preview_url = li.selectFirst(".still img")?.absUrl("src")?.ifEmpty { null }
             }
         }.orEmpty().distinctBy { it.url }
@@ -239,12 +282,11 @@ class HentaiDB : Source() {
     // ============================ Video Links =============================
 
     override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
-        val html = client.get(getEpisodeUrl(episode), headers).bodyString()
+        val html = client.get(getEpisodeUrl(episode), pageHeaders).bodyString()
         val json = html.substringAfter("window.EP=", "").substringBefore("</script>").trim().removeSuffix(";")
         if (json.isEmpty()) throw Exception("No player data found on this episode page")
         val data = json.parseAs<EpisodeDataDto>()
 
-        val videoHeaders = headers.newBuilder().set("Accept", "*/*").build()
         val hosters = buildHosters(data, data.src, dub = false, videoHeaders) +
             buildHosters(data, data.dub, dub = true, videoHeaders)
         if (hosters.isEmpty()) throw Exception("No video sources found")
@@ -274,7 +316,7 @@ class HentaiDB : Source() {
             q?.ifEmpty { null } ?: resolution?.let { "${it}p" },
             codecLabel(c),
             sz?.takeIf { it > 0 }?.let(::formatSize),
-        ).joinToString(" • ").ifEmpty { "Video" }
+        ).joinToString(SEPARATOR).ifEmpty { "Video" }
         val bitrate = if (sz != null && d != null && d > 0) (sz * 8 / d).coerceAtMost(Int.MAX_VALUE.toLong()).toInt() else null
 
         return Video(
@@ -413,9 +455,11 @@ class HentaiDB : Source() {
         private const val CATALOG_TTL_MS = 30 * 60 * 1000L
         private const val DUB_SUFFIX = "[Dub]"
 
+        // Written as an escape so the bullet can never be mangled by a non-UTF-8 editor or tool again.
+        private const val SEPARATOR = " \u2022 "
+
         private val CATALOG_PATH_REGEX = Regex("""(/cat-[\w-]+\.js)""")
         private val RESOLUTION_REGEX = Regex("""(\d{3,4})p""")
-        private val WHITESPACE_REGEX = Regex("""\s+""")
 
         private const val PREF_QUALITY_KEY = "preferred_quality"
         private const val PREF_QUALITY_DEFAULT = "1080"

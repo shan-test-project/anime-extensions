@@ -5,16 +5,31 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * In-memory port of the site's own browse logic (`/js/query.*.js`): the same filters,
- * sort orders and search scoring the website applies to its catalog.
+ * In-memory port of the site's own browse logic (`/js/query.*.js`): the same query syntax,
+ * filters, sort orders and search scoring the website applies to its catalog.
+ *
+ * [collator] must behave like the site's `Intl.Collator('en', {sensitivity: 'base'})`. On Android,
+ * [java.text.Collator] is backed by ICU, which is what browsers use for `Intl.Collator`.
  */
-class HentaiDBCatalog(dto: CatalogDto) {
+class HentaiDBCatalog(
+    dto: CatalogDto,
+    private val collator: Comparator<String> = defaultCollator(),
+) {
 
     val tags: List<String> = dto.tags
 
     private val studioRaw: List<String> = dto.studios
 
     private val tagMigrations: Map<String, String> = dto.mig?.t.orEmpty()
+
+    /** Lower-cased meta tag name -> (fields when included, fields when excluded). */
+    private val metaTags: Map<String, List<List<Pair<String, Int>>>> = buildMap {
+        val meta = LinkedHashMap(META_TAGS)
+        dto.mig?.c.orEmpty().forEach { (name, censored) ->
+            if (name !in meta) meta[name] = if (censored) CENSORED_META else UNCENSORED_META
+        }
+        meta.forEach { (name, value) -> put(name.lowercase(Locale.ROOT), value) }
+    }
 
     val entries: List<Entry>
 
@@ -36,8 +51,6 @@ class HentaiDBCatalog(dto: CatalogDto) {
     private val tagIndex: Map<String, Int> = tags.withIndex().associate { it.value to it.index }
 
     private val foldedTags = HashMap<String, Int>()
-
-    private val collator: Collator = Collator.getInstance(Locale.ENGLISH).apply { strength = Collator.PRIMARY }
 
     private val orders = ConcurrentHashMap<String, List<Entry>>()
 
@@ -100,6 +113,99 @@ class HentaiDBCatalog(dto: CatalogDto) {
             ?: studioNames.keys.filter { it.indexOf(key) > 0 }.sortedWith(byCount).firstOrNull()
     }
 
+    // ============================ Query syntax ============================
+
+    /** The site's `typedTag`: an exact tag name, else a folded (or migrated) tag name. */
+    private fun typedTag(value: String): Int? = tagIndex[value] ?: foldedTags[fold(value)]
+
+    private fun sortKey(value: String): String? = value.takeIf { it in SORT_KEYS } ?: SORT_WORDS[value]
+
+    /**
+     * Port of the site's search box parser (`parse` in `/js/query.*.js`). Besides plain words it
+     * understands `tag:`, `-tag:`, `studio:`, `q:`, `subs:`, `type:`, `eps:`, `len:`, `sort:`, quoted
+     * phrases and the shortcut words `4k`, `en`, `dub`, `48fps`, `short`, `(un)censored`, `completed`,
+     * `ongoing`, `stalled` and `-<tag>`. Tokens the site ignores are ignored here too.
+     */
+    fun parse(input: String): Query {
+        val n = Query()
+        fun addTag(excluded: Boolean, index: Int) {
+            if (index !in n.includedTags && index !in n.excludedTags) {
+                (if (excluded) n.excludedTags else n.includedTags) += index
+            }
+        }
+        fun setAll(fields: List<Pair<String, Int>>) = fields.forEach { (field, value) ->
+            when (field) {
+                "c" -> n.cut = value
+                "q" -> n.minQuality = value
+                "f48" -> n.fps48 = value != 0
+            }
+        }
+
+        for (m in TOKEN_REGEX.findAll(input)) {
+            val g = m.groups
+            val key = g[2]?.value?.lowercase(Locale.ROOT)
+            if (key != null) {
+                val neg = g[1]?.value == "-"
+                val v = g[3]?.value ?: g[4]?.value.orEmpty()
+                val lv = v.lowercase(Locale.ROOT)
+                when {
+                    key == "tag" -> {
+                        val k = typedTag(v)
+                        val meta = if (k == null) metaTags[lv]?.getOrNull(if (neg) 1 else 0) else null
+                        if (k != null) {
+                            addTag(neg, k)
+                        } else if (meta != null) {
+                            setAll(meta)
+                        }
+                    }
+                    neg -> {}
+                    key == "q" && Q_2160_REGEX.matches(lv) -> n.minQuality = 2160
+                    key == "q" && Q_1080_REGEX.matches(lv) -> n.minQuality = 1080
+                    key == "q" && Q_720_REGEX.matches(lv) -> n.minQuality = 720
+                    key == "subs" && SUBS_EN_REGEX.matches(lv) -> n.subtitles = 2
+                    key == "subs" && lv == "any" -> n.subtitles = 1
+                    key == "type" && TYPE_KEYS.indexOf(fold(v)) > 0 -> n.type = TYPE_KEYS.indexOf(fold(v))
+                    key == "eps" && EPS_REGEX.matches(lv) -> n.episodes = when {
+                        lv == "1" -> 1
+                        lv[0] == '5' -> 5
+                        else -> 2
+                    }
+                    key == "len" && lv in LENGTHS -> n.length = lv
+                    key == "studio" && resolveStudio(v) != null -> n.studio = resolveStudio(v)!!
+                    key == "sort" && sortKey(lv.removePrefix("-")) != null -> {
+                        n.sort = sortKey(lv.removePrefix("-"))!!
+                        n.reversed = lv.startsWith("-")
+                    }
+                }
+                continue
+            }
+
+            g[5]?.value?.let { phrase ->
+                n.words += phrase.split(WHITESPACE_REGEX).filter(String::isNotEmpty)
+                continue
+            }
+
+            val w = g[6]?.value ?: continue
+            val lw = w.lowercase(Locale.ROOT)
+            val ng = lw.length > 1 && lw[0] == '-'
+            val b = if (ng) lw.substring(1) else lw
+            when {
+                b == "uncensored" -> n.cut = if (ng) 1 else 2
+                b == "censored" -> n.cut = if (ng) 2 else 1
+                ng -> typedTag(b)?.let { addTag(true, it) }
+                b == "4k" -> n.minQuality = 2160
+                b == "en" -> n.subtitles = 2
+                b == "48fps" -> n.fps48 = true
+                b == "dub" -> n.dub = true
+                b == "short" -> n.length = "short"
+                b in STATUS_WORDS -> n.status = STATUS_WORDS.indexOf(b) + 1
+                PARAM_REGEX.containsMatchIn(w) -> {}
+                else -> n.words += w
+            }
+        }
+        return n
+    }
+
     // ============================== Querying ==============================
 
     fun search(query: Query): List<Entry> {
@@ -157,7 +263,7 @@ class HentaiDBCatalog(dto: CatalogDto) {
             title.contains(" $t") -> 50
             i > 0 -> 35
             r.studioWords.contains(" $t") -> 25
-            " ${r.row.k}".lowercase(Locale.ROOT).contains(" $t") -> 25
+            " ${r.row.k}".contains(" $t") -> 25
             r.row.g.any { k -> tagWords.getOrNull(k)?.any { it.startsWith(t) } == true } -> 15
             else -> 0
         }
@@ -219,21 +325,21 @@ class HentaiDBCatalog(dto: CatalogDto) {
     }
 
     class Query(
-        val words: List<String> = emptyList(),
-        val sort: String = "pop",
-        val reversed: Boolean = false,
-        val minQuality: Int = 0,
-        val subtitles: Int = 0,
-        val cut: Int = 0,
-        val fps48: Boolean = false,
-        val status: Int = 0,
-        val type: Int = 0,
-        val episodes: Int = 0,
-        val length: String = "",
-        val dub: Boolean = false,
-        val studio: String = "",
-        val includedTags: List<Int> = emptyList(),
-        val excludedTags: List<Int> = emptyList(),
+        val words: MutableList<String> = mutableListOf(),
+        var sort: String = "pop",
+        var reversed: Boolean = false,
+        var minQuality: Int = 0,
+        var subtitles: Int = 0,
+        var cut: Int = 0,
+        var fps48: Boolean = false,
+        var status: Int = 0,
+        var type: Int = 0,
+        var episodes: Int = 0,
+        var length: String = "",
+        var dub: Boolean = false,
+        var studio: String = "",
+        val includedTags: MutableList<Int> = mutableListOf(),
+        val excludedTags: MutableList<Int> = mutableListOf(),
     )
 
     companion object {
@@ -243,6 +349,56 @@ class HentaiDBCatalog(dto: CatalogDto) {
 
         private val NON_ALNUM_REGEX = Regex("[^a-z0-9]+")
         private val STUDIO_SPLIT_REGEX = Regex("\\s*,\\s*")
+
+        // JavaScript's \s also matches Unicode spaces; mirror it so tokens split like the site.
+        private const val JS_SPACE = "\\s\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF"
+        private val WHITESPACE_REGEX = Regex("[$JS_SPACE]+")
+        private val TOKEN_REGEX = Regex(
+            """(-?)([a-z]+):(?:"([^"]*)"|([^$JS_SPACE]+))|"([^"]*)"|([^$JS_SPACE]+)""",
+            RegexOption.IGNORE_CASE,
+        )
+        private val PARAM_REGEX = Regex("^(q|sort|tag|not|fq|fu|fc|fs|ft|fa|fe|fps|len|dub|studio)=", RegexOption.IGNORE_CASE)
+        private val Q_2160_REGEX = Regex("""(4k|2160p?\+?)""")
+        private val Q_1080_REGEX = Regex("""1080p?\+?""")
+        private val Q_720_REGEX = Regex("""720p?\+?""")
+        private val SUBS_EN_REGEX = Regex("en|eng|english")
+        private val EPS_REGEX = Regex("""1|2-4|2|5\+?""")
+        private val LENGTHS = listOf("short", "mid", "long")
+        private val STATUS_WORDS = listOf("completed", "ongoing", "stalled")
+        private val TYPE_KEYS = listOf("", "ova", "movie", "tv", "web", "other")
+
+        /** The site's `SORTS[key].w` words, also accepted by `sort:`. */
+        private val SORT_WORDS = mapOf(
+            "popular" to "pop",
+            "title" to "title",
+            "year" to "year",
+            "episodes" to "eps",
+            "runtime" to "runtime",
+            "eplen" to "eplen",
+            "quality" to "quality",
+            "subtitles" to "subs",
+            "studio" to "studio",
+        )
+
+        private val CENSORED_META = listOf(listOf("c" to 1), listOf("c" to 2))
+        private val UNCENSORED_META = listOf(listOf("c" to 2), listOf("c" to 1))
+
+        /** The site's `META` pseudo tags usable with `tag:`. */
+        private val META_TAGS: Map<String, List<List<Pair<String, Int>>>> = mapOf(
+            "Censored" to CENSORED_META,
+            "Uncensored" to UNCENSORED_META,
+            "4K" to listOf(listOf("q" to 2160)),
+            "4K 48Fps" to listOf(listOf("q" to 2160, "f48" to 1)),
+            "48Fps" to listOf(listOf("f48" to 1)),
+            "1080p" to listOf(listOf("q" to 1080)),
+            "720p" to listOf(listOf("q" to 720)),
+            "Hd" to listOf(listOf("q" to 720)),
+        )
+
+        fun defaultCollator(): Comparator<String> {
+            val collator = Collator.getInstance(Locale.ENGLISH).apply { strength = Collator.PRIMARY }
+            return Comparator { a, b -> collator.compare(a, b) }
+        }
 
         fun fold(value: String): String = value.lowercase(Locale.ROOT).replace(NON_ALNUM_REGEX, "")
     }

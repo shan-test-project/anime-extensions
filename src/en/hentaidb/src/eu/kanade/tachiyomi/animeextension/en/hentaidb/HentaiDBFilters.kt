@@ -18,11 +18,9 @@ object HentaiDBFilters {
         Triple("Studio", "studio", true),
     )
 
-    class SortFilter(state: Selection = Selection(0, false)) :
-        AnimeFilter.Sort("Sort by", SORTS.map { it.first }.toTypedArray(), state)
+    class SortFilter(state: Selection = Selection(0, false)) : AnimeFilter.Sort("Sort by", SORTS.map { it.first }.toTypedArray(), state)
 
-    open class ValueSelect(name: String, private val options: List<Pair<String, String>>) :
-        AnimeFilter.Select<String>(name, options.map { it.first }.toTypedArray()) {
+    open class ValueSelect(name: String, private val options: List<Pair<String, String>>) : AnimeFilter.Select<String>(name, options.map { it.first }.toTypedArray()) {
         val selected: String get() = options.getOrNull(state)?.second.orEmpty()
     }
 
@@ -73,72 +71,54 @@ object HentaiDBFilters {
         return AnimeFilterList(filters)
     }
 
-    fun buildQuery(words: List<String>, filters: AnimeFilterList, catalog: HentaiDBCatalog): HentaiDBCatalog.Query {
-        var sort = "pop"
-        var reversed = false
-        var type = 0
-        var status = 0
-        var cut = 0
-        var quality = 0
-        var subtitles = 0
-        var episodes = 0
-        var length = ""
-        var dub = false
-        var fps48 = false
-        var studio = ""
-        val included = linkedSetOf<Int>()
-        val excluded = linkedSetOf<Int>()
-
+    /**
+     * Applies the filter sheet on top of [query] (the parsed search text). Filters left at their
+     * default keep whatever the search text asked for, exactly like the site's search box.
+     */
+    fun buildQuery(query: HentaiDBCatalog.Query, filters: AnimeFilterList, catalog: HentaiDBCatalog): HentaiDBCatalog.Query {
+        fun include(index: Int) {
+            query.excludedTags.remove(index)
+            if (index !in query.includedTags) query.includedTags += index
+        }
+        fun exclude(index: Int) {
+            query.includedTags.remove(index)
+            if (index !in query.excludedTags) query.excludedTags += index
+        }
         fun splitTags(text: String) = text.split(',').mapNotNull { catalog.resolveTag(it) }
 
         filters.forEach { filter ->
             when (filter) {
                 is SortFilter -> filter.state?.let { selection ->
                     val (_, key, defaultAscending) = SORTS.getOrElse(selection.index) { SORTS.first() }
-                    sort = key
-                    reversed = selection.ascending != defaultAscending
+                    val reversed = selection.ascending != defaultAscending
+                    if (selection.index != 0 || reversed) {
+                        query.sort = key
+                        query.reversed = reversed
+                    }
                 }
-                is TypeFilter -> type = filter.selected.toIntOrNull() ?: 0
-                is StatusFilter -> status = filter.selected.toIntOrNull() ?: 0
-                is CutFilter -> cut = filter.selected.toIntOrNull() ?: 0
-                is QualityFilter -> quality = filter.selected.toIntOrNull() ?: 0
-                is SubtitleFilter -> subtitles = filter.selected.toIntOrNull() ?: 0
-                is EpisodeCountFilter -> episodes = filter.selected.toIntOrNull() ?: 0
-                is EpisodeLengthFilter -> length = filter.selected
-                is StudioSelectFilter -> if (filter.selected.isNotEmpty()) studio = filter.selected
-                is StudioTextFilter -> if (filter.state.isNotBlank()) studio = catalog.resolveStudio(filter.state) ?: HentaiDBCatalog.fold(filter.state)
-                is DubFilter -> dub = filter.state
-                is Fps48Filter -> fps48 = filter.state
+                is TypeFilter -> filter.selected.toIntOrNull()?.let { query.type = it }
+                is StatusFilter -> filter.selected.toIntOrNull()?.let { query.status = it }
+                is CutFilter -> filter.selected.toIntOrNull()?.let { query.cut = it }
+                is QualityFilter -> filter.selected.toIntOrNull()?.let { query.minQuality = it }
+                is SubtitleFilter -> filter.selected.toIntOrNull()?.let { query.subtitles = it }
+                is EpisodeCountFilter -> filter.selected.toIntOrNull()?.let { query.episodes = it }
+                is EpisodeLengthFilter -> if (filter.selected.isNotEmpty()) query.length = filter.selected
+                is StudioSelectFilter -> if (filter.selected.isNotEmpty()) query.studio = filter.selected
+                is StudioTextFilter -> if (filter.state.isNotBlank()) query.studio = catalog.resolveStudio(filter.state) ?: HentaiDBCatalog.fold(filter.state)
+                is DubFilter -> if (filter.state) query.dub = true
+                is Fps48Filter -> if (filter.state) query.fps48 = true
                 is TagGroup -> filter.state.forEach { tag ->
                     val index = catalog.resolveTag(tag.name) ?: return@forEach
                     when {
-                        tag.isIncluded() -> included += index
-                        tag.isExcluded() -> excluded += index
+                        tag.isIncluded() -> include(index)
+                        tag.isExcluded() -> exclude(index)
                     }
                 }
-                is IncludeTagsTextFilter -> included += splitTags(filter.state)
-                is ExcludeTagsTextFilter -> excluded += splitTags(filter.state)
+                is IncludeTagsTextFilter -> splitTags(filter.state).forEach(::include)
+                is ExcludeTagsTextFilter -> splitTags(filter.state).forEach(::exclude)
                 else -> {}
             }
         }
-        included.removeAll(excluded)
-
-        return HentaiDBCatalog.Query(
-            words = words,
-            sort = sort,
-            reversed = reversed,
-            minQuality = quality,
-            subtitles = subtitles,
-            cut = cut,
-            fps48 = fps48,
-            status = status,
-            type = type,
-            episodes = episodes,
-            length = length,
-            dub = dub,
-            studio = studio,
-            includedTags = included.toList(),
-            excludedTags = excluded.toList(),
-        )
+        return query
     }
 }

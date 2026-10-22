@@ -34,8 +34,14 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
 
-      - name: Run Spotless formatting
-        run: ./gradlew spotlessApply
+      - name: Pre-build Spotless (format HentaiDB)
+        run: ./gradlew :src:en:hentaidb:spotlessApply
+
+      - name: Show Spotless changes
+        run: git --no-pager diff --stat -- src/en/hentaidb
+
+      - name: Verify Spotless formatting
+        run: ./gradlew :src:en:hentaidb:spotlessCheck
 
       - name: Build HentaiDB
         run: ./gradlew :src:en:hentaidb:assembleRelease

@@ -21,6 +21,7 @@ class CatalogDto(
 @Serializable
 class CatalogMigrationDto(
     val t: Map<String, String> = emptyMap(),
+    val c: Map<String, Boolean> = emptyMap(),
 )
 
 /**
