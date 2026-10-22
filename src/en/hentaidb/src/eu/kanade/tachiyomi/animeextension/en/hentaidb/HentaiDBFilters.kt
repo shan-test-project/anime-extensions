@@ -59,8 +59,8 @@ object HentaiDBFilters {
             AnimeFilter.Separator(),
         )
         if (catalog != null) {
-            filters += StudioSelectFilter(catalog.studiosByUsage)
-            filters += TagGroup(catalog.tagsByUsage)
+            filters += StudioSelectFilter(catalog.studiosAlphabetical)
+            filters += TagGroup(catalog.tagsAlphabetical)
         } else {
             filters += AnimeFilter.Header("Browse once, then press Reset to load the studio and tag lists")
             filters += StudioTextFilter()

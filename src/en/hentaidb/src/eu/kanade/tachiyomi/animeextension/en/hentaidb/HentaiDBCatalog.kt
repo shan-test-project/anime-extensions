@@ -83,17 +83,15 @@ class HentaiDBCatalog(
         }
     }
 
-    /** Tags ordered by how many titles use them. */
-    val tagsByUsage: List<String>
-        get() = tags.indices.filter { tagUses[it] > 0 }.sortedByDescending { tagUses[it] }.map { tags[it] }
+    /** Tags in A-Z order, for the filter sheet. */
+    val tagsAlphabetical: List<String>
+        get() = tags.indices.filter { tagUses[it] > 0 }.map { tags[it] }
+            .sortedWith { a, b -> collator.compare(a, b).takeIf { it != 0 } ?: a.compareTo(b) }
 
-    /** Studios ordered by title count, as (key, display name). */
-    val studiosByUsage: List<Pair<String, String>>
+    /** Studios in A-Z order of their display name, as (key, display name), for the filter sheet. */
+    val studiosAlphabetical: List<Pair<String, String>>
         get() = studioNames.entries
-            .sortedWith(
-                compareByDescending<Map.Entry<String, String>> { studioCounts[it.value] ?: 0 }
-                    .thenComparator { a, b -> collator.compare(a.value, b.value) },
-            )
+            .sortedWith { a, b -> collator.compare(a.value, b.value).takeIf { it != 0 } ?: a.value.compareTo(b.value) }
             .map { it.key to it.value }
 
     fun resolveTag(name: String): Int? {

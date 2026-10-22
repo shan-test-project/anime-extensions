@@ -14,13 +14,19 @@ import keiyoushi.utils.addListPreference
 import keiyoushi.utils.bodyString
 import keiyoushi.utils.delegate
 import keiyoushi.utils.parseAs
-import keiyoushi.utils.useAsJsoup
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import okhttp3.CacheControl
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import java.util.Locale
+import java.util.concurrent.TimeUnit
+import kotlin.coroutines.cancellation.CancellationException
 
 class HentaiDB : Source() {
 
@@ -108,7 +114,10 @@ class HentaiDB : Source() {
         val home = client.get(baseUrl, pageHeaders).bodyString()
         val path = CATALOG_PATH_REGEX.find(home)?.groupValues?.get(1)
             ?: throw Exception("Could not locate the catalog. Open the site in WebView and try again.")
-        val script = client.get(baseUrl + path, scriptHeaders).bodyString()
+        // The catalog file name contains a content hash and the site serves it as `immutable` for a year,
+        // so a copy in the app's HTTP disk cache is always valid. Allowing it to be reused skips a ~150 KB
+        // download after every app restart and every catalog refresh until the site publishes a new file.
+        val script = client.get(baseUrl + path, scriptHeaders, IMMUTABLE_CACHE).bodyString()
         val json = script.substringAfter("=").trim().removeSuffix(";")
         return HentaiDBCatalog(json.parseAs<CatalogDto>())
     }
@@ -187,13 +196,65 @@ class HentaiDB : Source() {
 
     private fun SAnime.slug(): String = url.substringAfter("/s/").substringBefore('?').trim('/')
 
-    private suspend fun seriesPage(anime: SAnime): Document? = runCatching {
-        client.get(getAnimeUrl(anime), pageHeaders).useAsJsoup()
-    }.getOrNull()
+    private class PageResult(val html: String, val url: String)
+
+    private class PendingPage(val createdAt: Long) {
+        val result = CompletableDeferred<PageResult?>()
+    }
+
+    private val seriesPagesLock = Any()
+    private val seriesPages = HashMap<String, PendingPage>()
+
+    /**
+     * The app asks for details and episodes at the same time, and both are read from the same series
+     * page. Sharing one request (and reusing it for a few seconds) halves the page loads per title.
+     * Cloudflare already caches these pages for 60 seconds, so the content is the same either way.
+     */
+    private suspend fun seriesPage(anime: SAnime): Document? {
+        val url = getAnimeUrl(anime)
+        val now = System.currentTimeMillis()
+        var owner = false
+        val pending = synchronized(seriesPagesLock) {
+            seriesPages.values.removeAll { now - it.createdAt >= SERIES_PAGE_TTL_MS }
+            seriesPages.getOrPut(url) { PendingPage(now).also { owner = true } }
+        }
+        val result = if (owner) {
+            val fetched = try {
+                fetchPage(url)
+            } catch (e: CancellationException) {
+                forgetSeriesPage(url, pending)
+                pending.result.complete(null)
+                throw e
+            }
+            if (fetched == null) forgetSeriesPage(url, pending)
+            pending.result.complete(fetched)
+            fetched
+        } else {
+            // If the shared request failed, try once on our own, exactly as before.
+            pending.result.await() ?: fetchPage(url)
+        }
+        return result?.let { Jsoup.parse(it.html, it.url) }
+    }
+
+    private fun forgetSeriesPage(url: String, pending: PendingPage) = synchronized(seriesPagesLock) {
+        if (seriesPages[url] === pending) seriesPages.remove(url)
+    }
+
+    private suspend fun fetchPage(url: String): PageResult? = try {
+        client.get(url, pageHeaders).use { PageResult(it.body.string(), it.request.url.toString()) }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        null
+    }
 
     override suspend fun getAnimeDetails(anime: SAnime): SAnime {
-        val entry = runCatching { catalog().bySlug[anime.slug()] }.getOrNull()
-        val doc = seriesPage(anime)
+        // Load the catalog and the series page at the same time instead of one after the other.
+        val (entry, doc) = coroutineScope {
+            val entry = async { runCatching { catalog().bySlug[anime.slug()] }.getOrNull() }
+            val doc = async { seriesPage(anime) }
+            entry.await() to doc.await()
+        }
         if (entry == null && doc == null) throw Exception("Could not load this title")
 
         val meta = doc?.select(".hero dl.meta > div, .hero dl.reg > div")
@@ -453,6 +514,9 @@ class HentaiDB : Source() {
 
         private const val PAGE_SIZE = 30
         private const val CATALOG_TTL_MS = 30 * 60 * 1000L
+        private const val SERIES_PAGE_TTL_MS = 30 * 1000L
+
+        private val IMMUTABLE_CACHE = CacheControl.Builder().maxAge(365, TimeUnit.DAYS).build()
         private const val DUB_SUFFIX = "[Dub]"
 
         // Written as an escape so the bullet can never be mangled by a non-UTF-8 editor or tool again.
