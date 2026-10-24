@@ -2,7 +2,11 @@ ext {
     extName = 'AV1Encodes'
     extClass = '.AV1Encodes'
     libVersion = 16
-    extVersionCode = 2
+    extVersionCode = 3
 }
 
 apply plugin: "kei.plugins.extension.legacy"
+
+dependencies {
+    implementation(project(':lib:cloudflareinterceptor'))
+}
