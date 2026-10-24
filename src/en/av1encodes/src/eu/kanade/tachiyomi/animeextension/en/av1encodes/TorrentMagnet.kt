@@ -33,12 +33,17 @@ internal object TorrentMagnet {
                     info = reader.readValue() as? Map<*, *>
                     infoEnd = reader.pos
                 }
-                "announce" -> (reader.readValue() as? ByteArray)?.let { trackers += it.decodeToString() }
-                "announce-list" ->
+                "announce" -> {
+                    (reader.readValue() as? ByteArray)?.let { trackers += it.decodeToString() }
+                }
+                "announce-list" -> {
                     (reader.readValue() as? List<*>)?.forEach { tier ->
                         (tier as? List<*>)?.forEach { url -> (url as? ByteArray)?.let { trackers += it.decodeToString() } }
                     }
-                else -> reader.readValue()
+                }
+                else -> {
+                    reader.readValue()
+                }
             }
         }
         require(infoStart >= 0 && info != null) { "Torrent has no info dictionary" }
@@ -108,8 +113,12 @@ internal object TorrentMagnet {
                 pos = end + 1
                 value
             }
-            in '0'..'9' -> readString()
-            else -> throw IllegalArgumentException("Invalid bencode at byte $pos")
+            in '0'..'9' -> {
+                readString()
+            }
+            else -> {
+                throw IllegalArgumentException("Invalid bencode at byte $pos")
+            }
         }
 
         fun readString(): ByteArray {

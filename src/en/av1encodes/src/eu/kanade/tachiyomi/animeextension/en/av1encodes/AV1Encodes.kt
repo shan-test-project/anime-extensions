@@ -335,9 +335,8 @@ class AV1Encodes : Source() {
         return doc
     }
 
-    private fun Document.detailCover(): String? =
-        selectFirst(".anime-image img, .anime-poster img, img.anime-poster, .anime-card img")?.imageUrl()
-            ?: selectFirst("meta[property=og:image]")?.absUrl("content")?.ifEmpty { null }
+    private fun Document.detailCover(): String? = selectFirst(".anime-image img, .anime-poster img, img.anime-poster, .anime-card img")?.imageUrl()
+        ?: selectFirst("meta[property=og:image]")?.absUrl("content")?.ifEmpty { null }
 
     override fun getAnimeUrl(anime: SAnime): String = baseUrl + anime.url
 
