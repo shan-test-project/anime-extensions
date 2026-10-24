@@ -9,7 +9,6 @@ import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
-import eu.kanade.tachiyomi.torrentutils.TorrentUtils
 import keiyoushi.network.get
 import keiyoushi.network.rateLimit
 import keiyoushi.utils.Source
@@ -20,21 +19,22 @@ import keiyoushi.utils.bodyString
 import keiyoushi.utils.delegate
 import keiyoushi.utils.formatBytes
 import keiyoushi.utils.parallelCatchingFlatMap
-import keiyoushi.utils.parallelCatchingMapNotNull
 import keiyoushi.utils.parallelMap
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
 import keiyoushi.utils.useAsJsoup
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import okhttp3.CacheControl
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -48,6 +48,7 @@ import java.io.IOException
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.Duration.Companion.seconds
 
 class AV1Encodes : Source() {
@@ -119,15 +120,18 @@ class AV1Encodes : Source() {
         .apply { if (!token.isNullOrBlank()) set("X-DDL-Token", token) }
         .build()
 
-    /** Headers handed to the player; site cookies (av1_client_id, cf_clearance) go along for site-hosted links. */
+    /**
+     * Headers handed to the player. Site cookies (av1_client_id, cf_clearance) and
+     * Origin only go to the site's own hosts; file hosts just get the Referer.
+     */
     private fun videoHeaders(url: String): Headers {
         val builder =
             headersBuilder()
                 .set("Accept", "*/*")
                 .set("Referer", "$baseUrl/")
-                .set("Origin", baseUrl)
         val httpUrl = url.toHttpUrlOrNull()
         if (httpUrl != null && httpUrl.host in mirrorHosts()) {
+            builder.set("Origin", baseUrl)
             val cookies = client.cookieJar.loadForRequest(httpUrl)
             if (cookies.isNotEmpty()) builder.set("Cookie", cookies.joinToString("; ") { "${it.name}=${it.value}" })
         }
@@ -546,7 +550,7 @@ class AV1Encodes : Source() {
         val now = System.currentTimeMillis()
         if (!fresh) listingCache[url]?.let { (time, list) -> if (now - time < LISTING_TTL_MS) return list }
 
-        val response = client.get(url, pageHeaders("$baseUrl/anime/$slug"), ensureSuccess = false)
+        val response = client.get(url, pageHeaders("$baseUrl/anime/$slug"), CacheControl.FORCE_NETWORK, ensureSuccess = false)
         if (response.code == 404) {
             response.close()
             return emptyList()
@@ -634,33 +638,66 @@ class AV1Encodes : Source() {
 
     // =============================== Hosters ==============================
 
-    override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
+    /**
+     * One hoster per quality. None of them is lazy: the player only auto-loads
+     * non-lazy hosters, so all-lazy hosters meant nothing ever started and the
+     * player answered "No available videos".
+     *
+     * The preferred quality is fetched in full; the other listings only get a
+     * short grace period, so one slow page on a weak connection never holds
+     * back the episode.
+     */
+    override suspend fun getHosterList(episode: SEpisode): List<Hoster> = coroutineScope {
         val ref =
             EpisodeRef.parse(episode.url)
                 ?: throw Exception("Old episode link — refresh the episode list (pull down on the anime page)")
-        val resolutions = seasonResolutions(ref.slug, ref.season)
+        val preferred = prefQuality.toIntOrNull()
+        val ordered =
+            seasonResolutions(ref.slug, ref.season).entries.sortedWith(
+                compareByDescending<Map.Entry<Int, String>> { it.key == preferred }
+                    .thenByDescending { it.value == ref.resolution }
+                    .thenByDescending { it.key },
+            )
 
-        val hosters =
-            resolutions.entries.toList().parallelCatchingMapNotNull { (height, resolution) ->
-                val entries = fetchListing(ref.slug, ref.season, resolution)
-                val match = entries.findMatch(ref) ?: return@parallelCatchingMapNotNull null
-                val data =
-                    HosterData(
-                        href = match.href,
-                        referer = listingUrl(ref.slug, ref.season, resolution).toString(),
-                        resolution = height,
-                        audio = match.audio,
-                        ddl = match.ddl,
-                    )
-                Hoster(
-                    hosterUrl = baseUrl + match.href,
-                    hosterName = "${height}p" + (match.audio?.let { " · $it" } ?: ""),
-                    internalData = data.toJsonString(),
-                    lazy = true,
-                )
+        val jobs =
+            ordered.map { (height, resolution) ->
+                Triple(height, resolution, async { runCatching { fetchListing(ref.slug, ref.season, resolution) }.getOrNull() })
             }
-        if (hosters.isEmpty()) throw Exception("No servers found for this episode")
-        return hosters.sortHosters()
+        var deadline = 0L
+        val found =
+            jobs.mapNotNull { (height, resolution, job) ->
+                val entries =
+                    if (deadline == 0L) {
+                        job.await().also { deadline = System.currentTimeMillis() + OPTIONAL_LISTING_MS }
+                    } else {
+                        withTimeoutOrNull((deadline - System.currentTimeMillis()).coerceAtLeast(1L)) { job.await() }
+                    }
+                entries?.findMatch(ref)?.let { Triple(height, resolution, it) }
+            }
+        jobs.forEach { it.third.cancel() }
+        if (found.isEmpty()) throw Exception("No servers found for this episode. Pull down on the anime page to refresh, then retry.")
+
+        val gateKey = episode.url + "#" + System.nanoTime()
+        if (gates.size > GATE_CACHE_SIZE) gates.clear()
+        gates[gateKey] = CompletableDeferred()
+
+        found.mapIndexed { index, (height, resolution, match) ->
+            val data =
+                HosterData(
+                    href = match.href,
+                    referer = listingUrl(ref.slug, ref.season, resolution).toString(),
+                    resolution = height,
+                    audio = match.audio,
+                    ddl = match.ddl,
+                    primary = index == 0,
+                    gate = gateKey,
+                )
+            Hoster(
+                hosterUrl = baseUrl + match.href,
+                hosterName = "${height}p" + (match.audio?.let { " · $it" } ?: ""),
+                internalData = data.toJsonString(),
+            )
+        }
     }
 
     private fun List<EpisodeEntry>.findMatch(ref: EpisodeRef): EpisodeEntry? {
@@ -684,23 +721,63 @@ class AV1Encodes : Source() {
 
     // =============================== Videos ===============================
 
+    /** Per-episode signal: backup qualities start once the primary one is done. */
+    private val gates = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
+
+    /** The site's gateway bans bursts, so backup qualities resolve two at a time. */
+    private val backupPermits = Semaphore(BACKUP_CONCURRENCY)
+
     override suspend fun getVideoList(hoster: Hoster): List<Video> {
         hoster.videoList?.takeIf { it.isNotEmpty() }?.let { return it }
         val data = hoster.internalData.parseAs<HosterData>()
+        val gate = gates[data.gate]
 
-        val embedded = data.ddl?.let { runCatching { parseDdl(json.parseToJsonElement(it)) }.getOrNull() }
-        val links =
-            embedded?.takeIf { it.hasPlayable() } ?: try {
-                resolveDownloadPage(data)
-            } catch (e: Exception) {
-                // The ?token= on download links is time-limited: reload the listing once for a fresh one.
-                val refreshed = refreshHref(data) ?: throw e
-                resolveDownloadPage(data.copy(href = refreshed))
+        if (data.primary) {
+            try {
+                return resolveHoster(data, hoster.hosterName)
+            } finally {
+                gate?.complete(Unit)
             }
+        }
+        // Give the preferred quality the connection first; it is the one that plays.
+        gate?.let { withTimeoutOrNull(PRIMARY_HEAD_START_MS) { it.await() } }
+        return backupPermits.withPermit { resolveHoster(data, hoster.hosterName) }
+    }
 
-        val videos = buildVideos(links, data)
-        if (videos.isEmpty()) throw Exception("The site returned no playable link for ${hoster.hosterName}")
-        return videos.sortVideos()
+    private suspend fun resolveHoster(
+        data: HosterData,
+        name: String,
+    ): List<Video> {
+        val videos = buildVideos(resolveLinks(data), data)
+        if (videos.isEmpty()) throw Exception("The site returned no playable link for $name")
+        // `preferred` lets the player start this video the moment it is ready instead of
+        // waiting for every other quality to finish loading.
+        return videos.sortVideos().mapIndexed { index, video ->
+            video.copy(preferred = data.primary && index == 0)
+        }
+    }
+
+    private suspend fun resolveLinks(data: HosterData): DdlLinks {
+        data.ddl
+            ?.let { raw -> runCatching { parseDdl(json.parseToJsonElement(raw)) }.getOrNull() }
+            ?.takeIf { it.hasPlayable() }
+            ?.let { return it }
+
+        // Fast path: a recent X-DDL-Token is reused, skipping the download page round-trip.
+        cachedToken()?.let { token ->
+            val links = fetchDdl(listOf(fileNameOf(data.href)), token, baseUrl + data.href)
+            if (links != null) return links
+            tokenCache = null
+        }
+
+        return try {
+            resolveDownloadPage(data)
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            // The ?token= on download links is time-limited: reload the listing once for a fresh one.
+            val refreshed = refreshHref(data) ?: throw e
+            resolveDownloadPage(data.copy(href = refreshed))
+        }
     }
 
     private suspend fun refreshHref(data: HosterData): String? {
@@ -708,6 +785,16 @@ class AV1Encodes : Source() {
         val entries = fetchListing(ref.slug, ref.season, ref.resolution, fresh = true)
         return entries.findMatch(ref)?.href?.takeIf { it != data.href }
     }
+
+    @Volatile private var tokenCache: Triple<String, String, Long>? = null
+
+    private fun cachedToken(): String? {
+        val (host, token, time) = tokenCache ?: return null
+        if (host != baseUrl || System.currentTimeMillis() - time > TOKEN_TTL_MS) return null
+        return token
+    }
+
+    private fun fileNameOf(href: String): String = decode(href.substringBefore('?').substringAfterLast('/'))
 
     /**
      * The download page sits behind a human-verification widget, but its markup
@@ -717,7 +804,7 @@ class AV1Encodes : Source() {
      */
     private suspend fun resolveDownloadPage(data: HosterData): DdlLinks {
         val pageUrl = baseUrl + data.href
-        val html = client.get(pageUrl, pageHeaders(data.referer.toSiteUrl())).bodyString()
+        val html = client.get(pageUrl, pageHeaders(data.referer.toSiteUrl()), CacheControl.FORCE_NETWORK).bodyString()
         val token = extractDdlToken(html)
         val pageWatch = extractWatchLink(html)
         val fileName =
@@ -727,9 +814,11 @@ class AV1Encodes : Source() {
                 ?.get(1)
                 ?.let { Parser.unescapeEntities(it, false) }
                 ?.takeIf { it.isNotBlank() }
-                ?: decode(data.href.substringBefore('?').substringAfterLast('/'))
+                ?: fileNameOf(data.href)
 
-        val ddl = fetchDdl(fileName, data.href, token, pageUrl)
+        val downloadPath = decode(data.href.substringBefore('?')).removePrefix("/download/")
+        val ddl = fetchDdl(listOf(fileName, downloadPath).distinct(), token, pageUrl)
+        if (ddl != null && token != null) tokenCache = Triple(baseUrl, token, System.currentTimeMillis())
         return when {
             ddl != null -> if (ddl.watch == null && pageWatch != null) ddl.copy(watch = pageWatch) else ddl
             pageWatch != null -> DdlLinks(null, null, pageWatch, null, null, fileName, null, emptyList(), emptyList())
@@ -738,13 +827,10 @@ class AV1Encodes : Source() {
     }
 
     private suspend fun fetchDdl(
-        fileName: String,
-        href: String,
+        candidates: List<String>,
         token: String?,
         referer: String,
     ): DdlLinks? {
-        val downloadPath = decode(href.substringBefore('?')).removePrefix("/download/")
-        val candidates = listOf(fileName, downloadPath).distinct()
         for (candidate in candidates) {
             val url =
                 baseUrl
@@ -755,7 +841,7 @@ class AV1Encodes : Source() {
                     .build()
             val body =
                 runCatching {
-                    client.get(url, apiHeaders(referer, token), ensureSuccess = false).bodyString()
+                    client.get(url, apiHeaders(referer, token), CacheControl.FORCE_NETWORK, ensureSuccess = false).bodyString()
                 }.getOrNull() ?: continue
             val element = runCatching { json.parseToJsonElement(body) }.getOrNull() ?: continue
             val links = parseDdl(element)
@@ -808,9 +894,8 @@ class AV1Encodes : Source() {
 
     private fun DdlLinks.hasPlayable() = stream != null || download != null || watch != null || dash != null || torrent != null
 
-    private fun DdlLinks.dashUrl(): String? {
-        dash?.let { return it }
-        val watchUrl = watch ?: return null
+    private fun dashFromWatch(watchUrl: String?): String? {
+        if (watchUrl == null) return null
         if (watchUrl.contains(".mpd")) return watchUrl
         if (!watchUrl.contains("/watch/")) return null
         return watchUrl
@@ -838,10 +923,13 @@ class AV1Encodes : Source() {
         }
         val subtitles = links.subtitles.map { Track(it.first, it.second) }
 
-        val torrentJob =
-            links.torrent?.takeIf { showTorrent }?.let { url ->
-                async { torrentVideo(url, title(SERVER_TORRENT), data) }
-            }
+        // Resolve the site's redirect links in parallel, once, here.
+        val stream = links.stream?.let { async { finalUrl(it, media = true) } }
+        val direct = links.download?.let { async { finalUrl(it, media = true) } }
+        val dash =
+            links.dash ?: dashFromWatch(links.watch) ?: links.watch
+                ?.takeIf { prefServer == SERVER_DASH }
+                ?.let { dashFromWatch(finalUrl(it, media = false)) }
 
         val videos = mutableListOf<Video>()
 
@@ -857,56 +945,112 @@ class AV1Encodes : Source() {
                     resolution = data.resolution,
                     headers = videoHeaders(url),
                     subtitleTracks = subtitles,
+                    mpvArgs = NETWORK_MPV_ARGS,
                     initialized = true,
                 )
         }
-        add(links.stream, SERVER_STREAM)
-        add(links.dashUrl(), SERVER_DASH)
-        add(links.download, SERVER_DIRECT)
-        torrentJob?.await()?.let(videos::add)
+        add(stream?.await(), SERVER_STREAM)
+        add(direct?.await(), SERVER_DIRECT)
+        add(dash, SERVER_DASH)
+        links.torrent?.takeIf { showTorrent }?.let { videos += torrentVideo(it, title(SERVER_TORRENT), data) }
         videos
+    }
+
+    private val redirectCache = ConcurrentHashMap<String, Pair<Long, String>>()
+
+    /**
+     * The links /get_ddl/ returns are short site redirects (/r/...). Handing those
+     * to the player made it walk the redirect through the site's bot gateway again
+     * on every buffer refill and seek, which tripped the gateway's burst limit
+     * ("no video found") and stalled weak connections. Following the redirect once
+     * here gives the player the final file URL on the file host directly.
+     *
+     * A tiny ranged GET is used (some file hosts refuse HEAD). Any failure falls
+     * back to the original link, so this can only make playback faster.
+     */
+    private suspend fun finalUrl(
+        url: String,
+        media: Boolean,
+    ): String {
+        val httpUrl = url.toHttpUrlOrNull() ?: return url
+        if (httpUrl.host !in mirrorHosts()) return url
+        val now = System.currentTimeMillis()
+        redirectCache[url]?.let { (time, resolved) -> if (now - time < REDIRECT_TTL_MS) return resolved }
+
+        val resolved =
+            withTimeoutOrNull(REDIRECT_TIMEOUT_MS) {
+                runCatching {
+                    val headers = videoHeaders(url).newBuilder().set("Range", "bytes=0-0").build()
+                    client.get(httpUrl, headers, CacheControl.FORCE_NETWORK, ensureSuccess = false).use { response ->
+                        val type = response.header("Content-Type").orEmpty()
+                        val ok = response.isSuccessful && (!media || !type.contains("html", ignoreCase = true))
+                        response.request.url.toString().takeIf { ok }
+                    }
+                }.getOrNull()
+            } ?: return url
+
+        if (redirectCache.size > REDIRECT_CACHE_SIZE) redirectCache.clear()
+        redirectCache[url] = now to resolved
+        return resolved
     }
 
     // ============================== Torrent ===============================
 
-    private suspend fun torrentVideo(
+    /**
+     * Torrent links are resolved only when that video is actually picked, so they
+     * no longer delay the other servers. The player is only ever handed a proper
+     * magnet link with `index=` as its very last parameter: the app's torrent
+     * engine reads everything after "index=" as a number and crashed on a raw
+     * .torrent URL or a magnet with more parameters after the index.
+     */
+    private fun torrentVideo(
         url: String,
         title: String,
         data: HosterData,
     ): Video {
         if (url.startsWith("magnet:")) {
-            return Video(videoUrl = url, videoTitle = title, resolution = data.resolution, initialized = true)
+            return Video(
+                videoUrl = TorrentMagnet.normalize(url, PUBLIC_TRACKERS),
+                videoTitle = title,
+                resolution = data.resolution,
+                initialized = true,
+            )
         }
-        val magnet = withTimeoutOrNull(TORRENT_TIMEOUT_MS) { runCatching { torrentToMagnet(url) }.getOrNull() }
         return Video(
-            videoUrl = magnet ?: url,
+            videoUrl = "$url#resolve",
             videoTitle = title,
             resolution = data.resolution,
-            internalData = if (magnet == null) TORRENT_PREFIX + url else "",
-            initialized = magnet != null,
+            internalData = TORRENT_PREFIX + url,
+            initialized = false,
         )
     }
 
-    /** Resolves a torrent that could not be converted while listing (e.g. a slow tracker site). */
     override suspend fun resolveVideo(video: Video): Video? {
         if (video.initialized || !video.internalData.startsWith(TORRENT_PREFIX)) return video
+        val url = video.internalData.removePrefix(TORRENT_PREFIX)
         val magnet =
-            runCatching { torrentToMagnet(video.internalData.removePrefix(TORRENT_PREFIX)) }.getOrNull()
+            withTimeoutOrNull(TORRENT_TIMEOUT_MS) { runCatching { torrentToMagnet(url) }.getOrNull() }
                 ?: return null
         return video.copy(videoUrl = magnet, internalData = "", initialized = true)
     }
 
     private suspend fun torrentToMagnet(url: String): String {
-        val response = client.get(url, videoHeaders(url), ensureSuccess = false)
-        val bytes = response.use { if (it.isSuccessful) it.body.bytes() else ByteArray(0) }
-        return runCatching { TorrentMagnet.fromTorrent(bytes) }.getOrElse {
-            // Fall back to the app's torrent server, which fetches and indexes the file itself.
-            withContext(Dispatchers.IO) {
-                val torrent = TorrentUtils.getTorrentInfo(url, "AV1Encodes")
-                val trackers = torrent.trackers.filter { it.isNotBlank() }.joinToString("") { "&tr=$it" }
-                "magnet:?xt=urn:btih:${torrent.hash}&dn=${torrent.hash}$trackers&index=1"
+        if (url.startsWith("magnet:")) return TorrentMagnet.normalize(url, PUBLIC_TRACKERS)
+        var lastError: Throwable? = null
+        repeat(TORRENT_ATTEMPTS) {
+            try {
+                val bytes =
+                    client.get(url, videoHeaders(url), CacheControl.FORCE_NETWORK, ensureSuccess = false).use { response ->
+                        if (!response.isSuccessful) throw IOException("HTTP ${response.code} while downloading the torrent")
+                        response.body.bytes()
+                    }
+                return TorrentMagnet.fromTorrent(bytes, PUBLIC_TRACKERS)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                lastError = e
             }
         }
+        throw IOException("Could not read the torrent file", lastError)
     }
 
     override fun List<Video>.sortVideos(): List<Video> {
@@ -916,15 +1060,7 @@ class AV1Encodes : Source() {
             compareByDescending<Video> { it.resolution == quality }
                 .thenByDescending { it.videoTitle.contains(" · $server") }
                 .thenBy { video ->
-                    SERVER_ORDER.indexOfFirst { video.videoTitle.contains(" · $it") }.let {
-                        if (it <
-                            0
-                        ) {
-                            SERVER_ORDER.size
-                        } else {
-                            it
-                        }
-                    }
+                    SERVER_ORDER.indexOfFirst { video.videoTitle.contains(" · $it") }.let { if (it < 0) SERVER_ORDER.size else it }
                 },
         )
     }
@@ -969,7 +1105,7 @@ class AV1Encodes : Source() {
             key = PREF_TORRENT_KEY,
             default = PREF_TORRENT_DEFAULT,
             title = "Show torrent links",
-            summary = "Adds the Torrent server (streams through the app's torrent engine)",
+            summary = "Adds the Torrent server (needs the app's torrent engine enabled). The magnet link is prepared only when you pick it",
         )
         screen.addSwitchPreference(
             key = PREF_COVERS_KEY,
@@ -1014,12 +1150,23 @@ class AV1Encodes : Source() {
             ?.takeIf { it.length >= 10 }
     }
 
-    private fun extractWatchLink(html: String): String? = WATCH_REGEX
-        .find(html)
-        ?.value
-        ?.replace("&amp;", "&")
-        ?.replace("\\/", "/")
-        ?.let(::absolute)
+    private fun extractWatchLink(html: String): String? {
+        val iframe =
+            runCatching {
+                Jsoup
+                    .parse(html, baseUrl)
+                    .selectFirst("iframe#anime-video-player, iframe[src*='/watch/'], iframe[src*='/r/']")
+                    ?.attr("src")
+                    ?.takeIf { it.isNotBlank() }
+            }.getOrNull()
+        if (iframe != null) return absolute(iframe.replace("&amp;", "&"))
+        return WATCH_REGEX
+            .find(html)
+            ?.value
+            ?.replace("&amp;", "&")
+            ?.replace("\\/", "/")
+            ?.let(::absolute)
+    }
 
     private fun JsonObject.string(key: String): String? = (this[key] as? JsonPrimitive)?.contentOrNull
 
@@ -1072,11 +1219,39 @@ class AV1Encodes : Source() {
         private const val SERVER_DASH = "DASH"
         private const val SERVER_DIRECT = "Direct DL"
         private const val SERVER_TORRENT = "Torrent"
-        private val SERVER_ORDER = listOf(SERVER_STREAM, SERVER_DASH, SERVER_DIRECT, SERVER_TORRENT)
+        private val SERVER_ORDER = listOf(SERVER_STREAM, SERVER_DIRECT, SERVER_DASH, SERVER_TORRENT)
         private const val PREF_SERVER_DEFAULT = SERVER_STREAM
 
         private const val TORRENT_PREFIX = "torrent:"
-        private const val TORRENT_TIMEOUT_MS = 8_000L
+        private const val TORRENT_TIMEOUT_MS = 25_000L
+        private const val TORRENT_ATTEMPTS = 2
+        private const val OPTIONAL_LISTING_MS = 6_000L
+        private const val PRIMARY_HEAD_START_MS = 6_000L
+        private const val BACKUP_CONCURRENCY = 2
+        private const val GATE_CACHE_SIZE = 32
+        private const val TOKEN_TTL_MS = 10 * 60 * 1000L
+        private const val REDIRECT_TIMEOUT_MS = 8_000L
+        private const val REDIRECT_TTL_MS = 5 * 60 * 1000L
+        private const val REDIRECT_CACHE_SIZE = 64
+
+        private val PUBLIC_TRACKERS =
+            listOf(
+                "udp://tracker.opentrackr.org:1337/announce",
+                "udp://open.stealth.si:80/announce",
+                "udp://tracker.torrent.eu.org:451/announce",
+                "udp://exodus.desync.com:6969/announce",
+                "udp://open.demonii.com:1337/announce",
+            )
+
+        /** Bigger read-ahead plus reconnects so playback survives a weak or flaky connection. */
+        private val NETWORK_MPV_ARGS =
+            listOf(
+                "cache" to "yes",
+                "demuxer-max-bytes" to "64MiB",
+                "demuxer-readahead-secs" to "120",
+                "network-timeout" to "30",
+                "stream-lavf-o-append" to "reconnect=1",
+            )
         private const val RATE_LIMIT_PERMITS = 8
         private const val DETAIL_TTL_MS = 2 * 60 * 1000L
         private const val DETAIL_CACHE_SIZE = 48

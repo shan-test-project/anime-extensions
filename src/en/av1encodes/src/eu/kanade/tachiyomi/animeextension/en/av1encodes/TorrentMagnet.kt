@@ -67,6 +67,32 @@ internal object TorrentMagnet {
         }
     }
 
+    /**
+     * Cleans a magnet link for the app's torrent engine: adds trackers and makes
+     * `index=` the very last parameter (the engine parses everything after
+     * "index=" as a number, so anything following it crashed playback).
+     */
+    fun normalize(
+        magnet: String,
+        extraTrackers: List<String> = emptyList(),
+    ): String {
+        val query = magnet.substringAfter('?', "")
+        val params = query.split('&').filter { it.isNotBlank() }
+        val index =
+            params
+                .firstOrNull { it.startsWith("index=") }
+                ?.substringAfter('=')
+                ?.toIntOrNull()
+                ?: 1
+        val kept = params.filterNot { it.startsWith("index=") }.toMutableList()
+        val known = kept.filter { it.startsWith("tr=") }.map { it.removePrefix("tr=") }.toSet()
+        extraTrackers
+            .map { encode(it.trim()) }
+            .filter { it.isNotEmpty() && it !in known }
+            .forEach { kept += "tr=$it" }
+        return "magnet:?" + kept.joinToString("&") + "&index=" + index
+    }
+
     /** 1-based index (torrent server convention) of the main video file. */
     private fun fileIndex(info: Map<*, *>): Int {
         val files = info["files"] as? List<*> ?: return 1

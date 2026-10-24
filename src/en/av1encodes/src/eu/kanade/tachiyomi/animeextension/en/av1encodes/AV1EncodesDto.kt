@@ -23,6 +23,10 @@ data class HosterData(
     val resolution: Int,
     val audio: String? = null,
     val ddl: String? = null,
+    /** The preferred quality: resolved first and marked `preferred` so playback starts at once. */
+    val primary: Boolean = false,
+    /** Per-episode key the backup qualities wait on before they start. */
+    val gate: String = "",
 )
 
 /** Normalised /get_ddl/ answer. All links are absolute. */
