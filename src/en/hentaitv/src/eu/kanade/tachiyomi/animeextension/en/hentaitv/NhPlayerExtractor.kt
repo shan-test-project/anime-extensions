@@ -212,10 +212,9 @@ class NhPlayerExtractor(
                 val ids = (1..5).mapNotNull { n -> (ordered[n] ?: positional.getOrNull(n - 1))?.let { n to it } }.toMap()
 
                 val attrs = GET_ATTR_REGEX.findAll(js).map { it.groupValues[1] }.toList()
-                fun attrOf(part: String, element: Int, fallback: Int): String =
-                    Regex("""$part\s*=\s*e$element\.getAttribute\('([^']+)'\)""").find(js)?.groupValues?.get(1)
-                        ?: attrs.getOrNull(fallback)
-                        ?: throw Exception("nhplayer: challenge attribute missing")
+                fun attrOf(part: String, element: Int, fallback: Int): String = Regex("""$part\s*=\s*e$element\.getAttribute\('([^']+)'\)""").find(js)?.groupValues?.get(1)
+                    ?: attrs.getOrNull(fallback)
+                    ?: throw Exception("nhplayer: challenge attribute missing")
 
                 return Challenge(sc, rid, ids, attrOf("p1", 1, 0), attrOf("p3", 3, 1), attrOf("ts", 5, 2))
             }

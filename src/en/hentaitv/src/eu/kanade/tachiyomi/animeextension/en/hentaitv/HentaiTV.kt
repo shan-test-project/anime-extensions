@@ -434,8 +434,7 @@ class HentaiTV : Source() {
         } ?: throw Exception("Could not load ${ref.name}")
     }
 
-    private fun Video.withPlayerOptions(title: String?): Video =
-        copy(videoTitle = title ?: videoTitle, mpvArgs = mpvArgs(), initialized = true)
+    private fun Video.withPlayerOptions(title: String?): Video = copy(videoTitle = title ?: videoTitle, mpvArgs = mpvArgs(), initialized = true)
 
     private suspend fun resolveNhPlayer(video: Video, ref: StreamRef, playerUrl: String): Video {
         keepWarmJob.start()
