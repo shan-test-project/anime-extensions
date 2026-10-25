@@ -75,10 +75,21 @@ class HentaiTV : Source() {
             .build()
     }
 
-    private val nhPlayer by lazy { NhPlayerExtractor(client, headers) }
+    /**
+     * The app's client opens a Cloudflare bypass WebView for any 403 served by Cloudflare. nhplayer
+     * answers a rejected challenge, and the CDN an expired link, with exactly such a 403, which must
+     * reach this extension as-is so it can simply sign a new link.
+     */
+    private val streamClient by lazy {
+        client.newBuilder()
+            .apply { interceptors().removeAll { it.javaClass.name.contains("Cloudflare", ignoreCase = true) } }
+            .build()
+    }
+
+    private val nhPlayer by lazy { NhPlayerExtractor(client, streamClient, headers) }
     private val playlistUtils by lazy { PlaylistUtils(client, videoHeaders) }
     private val universalExtractor by lazy { UniversalExtractor(client) }
-    private val proxy by lazy { KeepWarmProxy(client) }
+    private val proxy by lazy { KeepWarmProxy(streamClient) }
 
     private val prefBuffer by preferences.delegate(PREF_BUFFER_KEY, PREF_BUFFER_DEFAULT)
     private val prefServer by preferences.delegate(PREF_SERVER_KEY, PREF_SERVER_DEFAULT)

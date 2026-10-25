@@ -54,6 +54,8 @@ import kotlin.math.roundToInt
  */
 class NhPlayerExtractor(
     private val client: OkHttpClient,
+    /** Same client without the Cloudflare interceptor, for calls whose 403 is a plain answer. */
+    private val apiClient: OkHttpClient,
     private val headers: Headers,
 ) {
 
@@ -155,7 +157,7 @@ class NhPlayerExtractor(
             .set("Sec-Fetch-Mode", "cors")
             .set("Sec-Fetch-Site", "same-origin")
             .build()
-        val response = client.get(url, xhrHeaders, CacheControl.FORCE_NETWORK, ensureSuccess = false)
+        val response = apiClient.get(url, xhrHeaders, CacheControl.FORCE_NETWORK, ensureSuccess = false)
         val code = response.code
         val body = response.bodyString()
         val result = runCatching { body.parseAs<VideoUrlDto>() }.getOrNull()
@@ -324,7 +326,7 @@ class NhPlayerExtractor(
         headers["User-Agent"]?.let { builder.set("User-Agent", it) }
         if (builder["Referer"] == null) builder.set("Referer", playerUrl)
         val request = Request.Builder().url(url).headers(builder.build()).cacheControl(CacheControl.FORCE_NETWORK).build()
-        client.newCall(request).execute().use { response ->
+        apiClient.newCall(request).execute().use { response ->
             val bytes = response.body.bytes()
             runCatching { String(bytes).parseAs<VideoUrlDto>().url }.getOrNull()
                 ?.takeIf { it.startsWith("http") }
