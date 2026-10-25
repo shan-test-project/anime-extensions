@@ -67,9 +67,15 @@ class HentaiTV : Source() {
             .build()
     }
 
-    /** What the player page sends for the mp4 (the CDN only rejects non-browser user agents). */
+    /**
+     * Headers for the mp4 itself. The CDN's bot protection answers a Cloudflare challenge (403) when
+     * a browser User-Agent arrives over a TLS stack that is not a browser's, which is exactly what
+     * mpv's FFmpeg does: with the app's Chrome UA the player retries that 403 forever and never starts.
+     * A media-player UA is accepted from every client (FFmpeg, OkHttp, Java, curl), so use FFmpeg's own.
+     */
     private val videoHeaders: Headers by lazy {
         headers.newBuilder()
+            .set("User-Agent", PLAYER_USER_AGENT)
             .set("Referer", "${NhPlayerExtractor.NH_BASE}/")
             .set("Accept", "*/*")
             .build()
@@ -471,6 +477,7 @@ class HentaiTV : Source() {
      * FFmpeg auto-reconnect, so a dropped connection resumes from the current byte instead of failing.
      */
     private fun mpvArgs(): List<Pair<String, String>> = listOf(
+        "user-agent" to PLAYER_USER_AGENT,
         "cache" to "yes",
         "demuxer-max-bytes" to "${prefBuffer}MiB",
         "demuxer-max-back-bytes" to "${(prefBuffer.toIntOrNull() ?: 96) / 2}MiB",
@@ -611,6 +618,9 @@ class HentaiTV : Source() {
 
     companion object {
         private const val VIDEO_OBJECT_START = "{\"id\":\""
+
+        /** FFmpeg's default User-Agent: what mpv sends on its own and what the video CDN lets through. */
+        private const val PLAYER_USER_AGENT = "Lavf/61.7.100"
 
         private val PAGE_REGEX = Regex("""[?&]page=(\d+)""")
         private val RESOLUTION_REGEX = Regex("""(\d{3,4})p""")
