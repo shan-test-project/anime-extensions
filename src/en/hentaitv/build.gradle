@@ -1,0 +1,14 @@
+ext {
+    extName = 'HentaiTV'
+    extClass = '.HentaiTV'
+    libVersion = 16
+    extVersionCode = 1
+    isNsfw = true
+}
+
+apply plugin: "kei.plugins.extension.legacy"
+
+dependencies {
+    implementation(project(':lib:playlistutils'))
+    implementation(project(':lib:universalextractor'))
+}
