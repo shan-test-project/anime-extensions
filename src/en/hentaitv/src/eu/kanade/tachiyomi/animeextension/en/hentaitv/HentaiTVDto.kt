@@ -2,6 +2,8 @@ package eu.kanade.tachiyomi.animeextension.en.hentaitv
 
 import kotlinx.serialization.Serializable
 
+const val EMBED_UNKNOWN = "unknown"
+
 /** Response of `/api/browse` (28 per page) and `/api/search` (no paging, `total`/`pages` absent). */
 @Serializable
 class VideoListDto(
@@ -31,7 +33,8 @@ class VideoDto(
     val thumb: String? = null,
     val backdrop: String? = null,
     val featureImage: String? = null,
-    val embedUrl: String? = null,
+    /** `null` when the site has no player for the episode, [EMBED_UNKNOWN] when the field was absent. */
+    val embedUrl: String? = EMBED_UNKNOWN,
     val description: String? = null,
     val releasedAt: String? = null,
 )

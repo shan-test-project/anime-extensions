@@ -299,6 +299,7 @@ class HentaiTV : Source() {
                     episode_number = number.toFloat()
                     date_upload = DATE_FORMAT.tryParse(video.releasedAt)
                     scanlator = listOfNotNull(
+                        if (video.embedUrl == null) "No video on hentai.tv" else null,
                         video.quality?.ifBlank { null },
                         video.language?.ifBlank { null },
                         video.censored?.let { if (it) "Censored" else "Uncensored" },
@@ -393,7 +394,7 @@ class HentaiTV : Source() {
         val doc = client.get(getEpisodeUrl(episode), pageHeaders).useAsJsoup()
         val video = payloadVideos(flightPayload(doc)).firstOrNull { it.slug == slug }
         val embedUrl = doc.selectFirst("iframe[src*=nhplayer]")?.absUrl("src")?.ifBlank { null }
-            ?: video?.embedUrl?.ifBlank { null }
+            ?: video?.embedUrl?.takeIf { it.startsWith("http") }
             ?: doc.select("script[type=application/ld+json]").firstNotNullOfOrNull { EMBED_URL_REGEX.find(it.data())?.groupValues?.get(1) }
             ?: doc.selectFirst("iframe[src*='/v/']")?.absUrl("src")?.ifBlank { null }
             ?: throw Exception("No video available on hentai.tv for this episode")
