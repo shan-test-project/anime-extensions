@@ -1,0 +1,9 @@
+ext {
+    extName = 'MovieBox'
+    extClass = '.MovieBox'
+    libVersion = 16
+    extVersionCode = 1
+    isNsfw = false
+}
+
+apply plugin: "kei.plugins.extension.legacy"
