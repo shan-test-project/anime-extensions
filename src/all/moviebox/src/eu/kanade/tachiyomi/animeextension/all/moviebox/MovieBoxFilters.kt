@@ -24,8 +24,8 @@ object MovieBoxFilters {
 
     class TypeFilter : AnimeFilter.Select<String>("Type", TYPES.map { it.name }.toTypedArray())
 
-    open class ValueFilter(name: String, private val values: List<String>) : AnimeFilter.Select<String>(name, values.toTypedArray()) {
-        val selected: String get() = values[state]
+    open class ValueFilter(name: String, private val options: List<String>) : AnimeFilter.Select<String>(name, options.toTypedArray()) {
+        val selected: String get() = options[state]
     }
 
     class GenreFilter : ValueFilter("Genre (Movies & TV)", GENRES)
