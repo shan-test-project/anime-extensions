@@ -224,7 +224,7 @@ class Pornhub : Source() {
             .mapNotNull { it.toSAnime() }
             .distinctBy { it.url }
         val hasNext = doc.selectFirst("li.page_next:not(.disabled) a[href]") != null ||
-            doc.selectFirst("#moreDataBtn, .js-loadMoreData") != null && animes.isNotEmpty()
+            (doc.selectFirst("#moreDataBtn, .js-loadMoreData") != null && animes.isNotEmpty())
         return AnimesPage(animes, hasNext)
     }
 
