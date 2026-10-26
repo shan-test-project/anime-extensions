@@ -21,14 +21,26 @@ object PornhubFilters {
     class DurationFilter : SelectFilter("Duration", DURATIONS)
     class HdFilter : AnimeFilter.CheckBox("HD only")
 
-    fun getFilterList() = AnimeFilterList(
+    /** Pornstar list is fetched from the site; until it arrives only a placeholder is shown. */
+    class PornstarFilter(stars: List<Pair<String, String>>) :
+        SelectFilter(
+            "Pornstar",
+            if (stars.isEmpty()) {
+                arrayOf(Pair("Tap Reset to load pornstars", ""))
+            } else {
+                arrayOf(Pair("Any", "")) + stars.toTypedArray()
+            },
+        )
+
+    fun getFilterList(pornstars: List<Pair<String, String>> = emptyList()) = AnimeFilterList(
         AnimeFilter.Header("Tip: paste a Pornhub video, model, pornstar or channel link into search to open it"),
         OrientationFilter(),
         SortFilter(),
         PeriodFilter(),
         AnimeFilter.Separator(),
-        AnimeFilter.Header("Category applies when the search text is empty"),
+        AnimeFilter.Header("Category applies when the search text is empty. Pornstar works with or without search text."),
         CategoryFilter(),
+        PornstarFilter(pornstars),
         ProductionFilter(),
         DurationFilter(),
         HdFilter(),
@@ -42,10 +54,11 @@ object PornhubFilters {
         val production: String,
         val duration: String,
         val hd: Boolean,
+        val pornstar: String = "",
     ) {
         val isDefault: Boolean
             get() = orientation.isEmpty() && sort.isEmpty() && period.isEmpty() && category.isEmpty() &&
-                production.isEmpty() && duration.isEmpty() && !hd
+                production.isEmpty() && duration.isEmpty() && !hd && pornstar.isEmpty()
     }
 
     fun parse(filters: AnimeFilterList): Params {
@@ -58,6 +71,7 @@ object PornhubFilters {
             production = find(ProductionFilter::class.java),
             duration = find(DurationFilter::class.java),
             hd = filters.filterIsInstance<HdFilter>().firstOrNull()?.state ?: false,
+            pornstar = find(PornstarFilter::class.java),
         )
     }
 
@@ -94,7 +108,7 @@ object PornhubFilters {
 
     private val DURATIONS = arrayOf(
         Pair("Any", ""),
-        Pair("Under 10 min", "max_duration=10"),
+        Pair("Short videos (under 10 min)", "max_duration=10"),
         Pair("10+ min", "min_duration=10"),
         Pair("20+ min", "min_duration=20"),
         Pair("30+ min", "min_duration=30"),

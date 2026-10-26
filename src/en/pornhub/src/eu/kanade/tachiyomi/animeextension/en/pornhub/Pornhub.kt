@@ -12,12 +12,19 @@ import keiyoushi.network.addCookie
 import keiyoushi.network.get
 import keiyoushi.utils.Source
 import keiyoushi.utils.addListPreference
+import keiyoushi.utils.addSwitchPreference
 import keiyoushi.utils.delegate
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
 import keiyoushi.utils.useAsJsoup
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
@@ -55,7 +62,13 @@ class Pornhub : Source() {
                 "platform" to "pc",
             ),
         )
+        .dns(DohDns(network.client) { preferences.getBoolean(PREF_DOH_KEY, PREF_DOH_DEFAULT) })
         .build()
+
+    /** Local parallel downloader / HLS prefetcher the player streams through. */
+    private val proxy by lazy { StreamProxy(client) }
+
+    private val backgroundScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .set("Referer", "$baseUrl/")
@@ -94,6 +107,8 @@ class Pornhub : Source() {
     private val prefPopularSort by preferences.delegate(PREF_POPULAR_KEY, PREF_POPULAR_DEFAULT)
     private val prefPeriod by preferences.delegate(PREF_PERIOD_KEY, PREF_PERIOD_DEFAULT)
     private val prefBuffer by preferences.delegate(PREF_BUFFER_KEY, PREF_BUFFER_DEFAULT)
+    private val prefAccelerator by preferences.delegate(PREF_ACCEL_KEY, PREF_ACCEL_DEFAULT)
+    private val prefLatestMin by preferences.delegate(PREF_LATEST_MIN_KEY, PREF_LATEST_MIN_DEFAULT)
 
     // ============================== Popular ===============================
 
@@ -113,6 +128,7 @@ class Pornhub : Source() {
     override suspend fun getLatestUpdates(page: Int): AnimesPage {
         val url = "$baseUrl/video".toHttpUrl().newBuilder()
             .addQueryParameter("o", "cm")
+            .apply { if (prefLatestMin.isNotEmpty()) addQueryParameter("min_duration", prefLatestMin) }
             .addPage(page)
             .build()
         return videoListing(url)
@@ -120,14 +136,66 @@ class Pornhub : Source() {
 
     // =============================== Search ===============================
 
-    override fun getFilterList(): AnimeFilterList = PornhubFilters.getFilterList()
+    @Volatile private var pornstars: List<Pair<String, String>> = loadCachedPornstars()
+
+    @Volatile private var pornstarJob: Job? = null
+
+    /** Shows the cached pornstar list and refreshes it from the site in the background (tap Reset to see it). */
+    override fun getFilterList(): AnimeFilterList {
+        val age = System.currentTimeMillis() - preferences.getLong(PREF_PORNSTARS_TIME_KEY, 0L)
+        if ((pornstars.isEmpty() || age > PORNSTAR_TTL_MS) && pornstarJob?.isActive != true) {
+            pornstarJob = backgroundScope.launch { runCatching { fetchPornstars() } }
+        }
+        return PornhubFilters.getFilterList(pornstars)
+    }
+
+    private suspend fun fetchPornstars() = coroutineScope {
+        val pages = (1..PORNSTAR_PAGES).map { page ->
+            async {
+                runCatching {
+                    val url = "$baseUrl/pornstars?performerType=pornstar" + if (page > 1) "&page=$page" else ""
+                    client.get(url, pageHeaders).useAsJsoup()
+                        .select("li.pornstarLi a[href^=/pornstar/] img[alt]")
+                        .mapNotNull { img ->
+                            val slug = img.parent()?.attr("href")?.substringAfter("/pornstar/")?.substringBefore('/')?.substringBefore('?')
+                            val name = img.attr("alt").trim()
+                            if (slug.isNullOrBlank() || name.isBlank()) null else name to slug
+                        }
+                }.getOrDefault(emptyList())
+            }
+        }.awaitAll()
+        val list = pages.flatten().distinctBy { it.second }
+        if (list.isNotEmpty()) {
+            pornstars = list
+            preferences.edit()
+                .putString(PREF_PORNSTARS_KEY, list.joinToString("\n") { "${it.second}\t${it.first}" })
+                .putLong(PREF_PORNSTARS_TIME_KEY, System.currentTimeMillis())
+                .apply()
+        }
+    }
+
+    private fun loadCachedPornstars(): List<Pair<String, String>> = preferences.getString(PREF_PORNSTARS_KEY, null)
+        .orEmpty()
+        .lineSequence()
+        .mapNotNull { line ->
+            val slug = line.substringBefore('\t')
+            val name = line.substringAfter('\t', "")
+            if (slug.isBlank() || name.isBlank()) null else name to slug
+        }
+        .toList()
 
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         val trimmed = query.trim()
         linkTarget(trimmed)?.let { return openLink(it, page) }
 
         val params = PornhubFilters.parse(filters)
-        val url = if (trimmed.isNotEmpty()) searchUrl(trimmed, params, page) else browseUrl(params, page)
+        val starName = pornstars.firstOrNull { it.second == params.pornstar }?.first
+        val url = when {
+            params.pornstar.isNotEmpty() && trimmed.isEmpty() -> pornstarUrl(params, page)
+            params.pornstar.isNotEmpty() -> searchUrl("$trimmed ${starName ?: params.pornstar.replace('-', ' ')}", params, page)
+            trimmed.isNotEmpty() -> searchUrl(trimmed, params, page)
+            else -> browseUrl(params, page)
+        }
         return videoListing(url)
     }
 
@@ -149,6 +217,12 @@ class Pornhub : Source() {
             }
             .addPage(page)
             .build()
+    }
+
+    private fun pornstarUrl(params: PornhubFilters.Params, page: Int): HttpUrl {
+        val builder = "$baseUrl/pornstar/${params.pornstar}/videos".toHttpUrl().newBuilder()
+        if (params.sort in PORNSTAR_SORTS) builder.addQueryParameter("o", params.sort)
+        return builder.addPage(page).build()
     }
 
     private fun browseUrl(params: PornhubFilters.Params, page: Int): HttpUrl {
@@ -363,7 +437,9 @@ class Pornhub : Source() {
     // ============================ Video Links =============================
 
     override suspend fun getHosterList(episode: SEpisode): List<Hoster> = coroutineScope {
-        val page = videoPage(episode.url, fresh = true)
+        // Stream links stay valid for ~2 hours, so the page fetched for the details screen is reused.
+        val page = videoPage(episode.url)
+        val viewkey = episode.url.substringAfter("viewkey=").substringBefore('&')
         val flashVars = page.flashVars ?: throw Exception(unavailableMessage(page.doc))
         if (flashVars.videoUnavailable == true && flashVars.mediaDefinitions.isEmpty()) {
             throw Exception(unavailableMessage(page.doc))
@@ -375,7 +451,11 @@ class Pornhub : Source() {
             .map { def ->
                 val res = def.resolution()!!
                 Video(
-                    videoUrl = def.videoUrl,
+                    videoUrl = if (prefAccelerator) {
+                        proxy.registerHls("h${viewkey}_$res", def.videoUrl, videoHeaders) { freshHlsUrl(episode.url, res) }
+                    } else {
+                        def.videoUrl
+                    },
                     videoTitle = "HLS \u2022 ${res}p",
                     resolution = res,
                     headers = videoHeaders,
@@ -387,15 +467,24 @@ class Pornhub : Source() {
 
         val mp4Source = flashVars.mediaDefinitions.firstOrNull { it.format == "mp4" && it.videoUrl.contains("get_media") }
 
-        // Fetch the MP4 list and probe the preferred HLS stream at the same time; both are tiny requests.
-        val mp4Deferred = async { mp4Source?.let { runCatching { mp4Videos(it.videoUrl) }.getOrNull() }.orEmpty() }
-        val hlsDeferred = async { hlsVideos.firstOrNull()?.let { isReachable(it.videoUrl) } ?: false }
+        // No reachability probe any more: the accelerator refreshes refused HLS links on its own.
+        val mp4 = mp4Source?.let { runCatching { mp4Videos(it.videoUrl, episode.url, viewkey) }.getOrNull() }.orEmpty()
 
-        val mp4 = mp4Deferred.await()
-        val hlsOk = hlsDeferred.await()
+        // Start downloading the stream the player will most likely open first.
+        if (prefAccelerator) {
+            val first = if (prefServer == SERVER_MP4) {
+                mp4.firstOrNull() ?: hlsVideos.firstOrNull()
+            } else {
+                hlsVideos.firstOrNull() ?: mp4.firstOrNull()
+            }
+            first?.videoUrl?.let { url ->
+                val key = url.substringAfter("/mp4/").substringAfter("/hls/").substringBefore('/').substringBefore('.')
+                proxy.prewarm(key)
+            }
+        }
 
         buildList {
-            if (hlsVideos.isNotEmpty() && (hlsOk || mp4.isEmpty())) {
+            if (hlsVideos.isNotEmpty()) {
                 add(Hoster(hosterUrl = getEpisodeUrl(episode), hosterName = SERVER_HLS, videoList = hlsVideos))
             }
             if (mp4.isNotEmpty()) {
@@ -407,17 +496,19 @@ class Pornhub : Source() {
     override suspend fun getVideoList(hoster: Hoster): List<Video> = hoster.videoList.orEmpty()
 
     /** `video/get_media` returns direct progressive MP4 files; it needs the cookies set by the watch page. */
-    private suspend fun mp4Videos(getMediaUrl: String): List<Video> {
-        val url = if (getMediaUrl.startsWith("http")) getMediaUrl else baseUrl + getMediaUrl
-        val definitions = client.get(url, ajaxHeaders, CacheControl.FORCE_NETWORK)
-            .parseAs<List<MediaDefinitionDto>>(lenientJson)
+    private suspend fun mp4Videos(getMediaUrl: String, episodeUrl: String, viewkey: String): List<Video> {
+        val definitions = mp4Definitions(getMediaUrl)
         return definitions
             .filter { it.videoUrl.startsWith("http") && it.resolution() != null }
             .distinctBy { it.resolution() }
             .map { def ->
                 val res = def.resolution()!!
                 Video(
-                    videoUrl = def.videoUrl,
+                    videoUrl = if (prefAccelerator) {
+                        proxy.registerMp4("m${viewkey}_$res", def.videoUrl, videoHeaders) { freshMp4Url(episodeUrl, res) }
+                    } else {
+                        def.videoUrl
+                    },
                     videoTitle = "MP4 \u2022 ${res}p",
                     resolution = res,
                     headers = videoHeaders,
@@ -428,11 +519,22 @@ class Pornhub : Source() {
             .sortVideos()
     }
 
-    private suspend fun isReachable(url: String): Boolean = runCatching {
-        client.get(url, videoHeaders, CacheControl.FORCE_NETWORK, ensureSuccess = false).use { response ->
-            response.isSuccessful && response.peekBody(16).string().startsWith("#EXTM3U")
-        }
-    }.getOrDefault(false)
+    private suspend fun mp4Definitions(getMediaUrl: String): List<MediaDefinitionDto> {
+        val url = if (getMediaUrl.startsWith("http")) getMediaUrl else baseUrl + getMediaUrl
+        return client.get(url, ajaxHeaders, CacheControl.FORCE_NETWORK).parseAs<List<MediaDefinitionDto>>(lenientJson)
+    }
+
+    /** Used by the accelerator when a stream link expired or a CDN node refused it. */
+    private suspend fun freshHlsUrl(episodeUrl: String, res: Int): String? = videoPage(episodeUrl, fresh = true).flashVars
+        ?.mediaDefinitions
+        ?.firstOrNull { it.format == "hls" && it.resolution() == res && it.videoUrl.startsWith("http") }
+        ?.videoUrl
+
+    private suspend fun freshMp4Url(episodeUrl: String, res: Int): String? {
+        val getMedia = videoPage(episodeUrl, fresh = true).flashVars?.mediaDefinitions
+            ?.firstOrNull { it.format == "mp4" && it.videoUrl.contains("get_media") }?.videoUrl ?: return null
+        return mp4Definitions(getMedia).firstOrNull { it.resolution() == res && it.videoUrl.startsWith("http") }?.videoUrl
+    }
 
     private fun unavailableMessage(doc: Document): String = doc.selectFirst(".geoBlocked, .removed, .video-wrapper .notice, .userMessageSection")
         ?.text()?.trim()?.ifBlank { null }?.take(200)
@@ -453,7 +555,6 @@ class Pornhub : Source() {
         val preferred = prefQuality.toIntOrNull() ?: 1080
         return sortedWith(
             compareByDescending<Video> { it.resolution == preferred }
-                .thenByDescending { (it.resolution ?: 0) <= preferred }
                 .thenByDescending { it.resolution ?: 0 },
         )
     }
@@ -505,6 +606,28 @@ class Pornhub : Source() {
             entryValues = listOf("t", "w", "m", "y", "a"),
         )
         screen.addListPreference(
+            key = PREF_LATEST_MIN_KEY,
+            default = PREF_LATEST_MIN_DEFAULT,
+            title = "Latest tab minimum length",
+            summary = "%s\nShort videos are still available with the Duration filter.",
+            entries = listOf("10+ minutes", "20+ minutes", "30+ minutes", "Any length (includes short videos)"),
+            entryValues = listOf("10", "20", "30", ""),
+        )
+        screen.addSwitchPreference(
+            key = PREF_ACCEL_KEY,
+            default = PREF_ACCEL_DEFAULT,
+            title = "Fast playback (stream accelerator)",
+            summary = "Downloads MP4 in parallel pieces and prefetches HLS segments, refreshing expired links. " +
+                "Turn off only if playback fails.",
+        )
+        screen.addSwitchPreference(
+            key = PREF_DOH_KEY,
+            default = PREF_DOH_DEFAULT,
+            title = "Bypass DNS blocking (DNS over HTTPS)",
+            summary = "Resolves the site through Cloudflare/Google DNS over HTTPS, " +
+                "so it loads without a VPN when your ISP blocks it by DNS.",
+        )
+        screen.addListPreference(
             key = PREF_BUFFER_KEY,
             default = PREF_BUFFER_DEFAULT,
             title = "Buffer size",
@@ -521,6 +644,9 @@ class Pornhub : Source() {
         private const val TRANS_CATEGORY_ID = "83"
 
         private val PERIOD_SORTS = setOf("mv", "tr")
+        private val PORNSTAR_SORTS = setOf("mv", "tr", "lg", "ht")
+        private const val PORNSTAR_PAGES = 3
+        private const val PORNSTAR_TTL_MS = 3 * 24 * 60 * 60_000L
         private val UPLOADER_SEGMENTS = setOf("model", "pornstar", "channels", "users")
         private val SIDEBAR_LISTS = setOf("hottestMenuSection", "recommMenuSection", "bottomVideos")
 
@@ -545,5 +671,13 @@ class Pornhub : Source() {
         private const val PREF_PERIOD_DEFAULT = "w"
         private const val PREF_BUFFER_KEY = "buffer_size_mib"
         private const val PREF_BUFFER_DEFAULT = "96"
+        private const val PREF_ACCEL_KEY = "stream_accelerator"
+        private const val PREF_ACCEL_DEFAULT = true
+        private const val PREF_DOH_KEY = "dns_over_https"
+        private const val PREF_DOH_DEFAULT = true
+        private const val PREF_LATEST_MIN_KEY = "latest_min_duration"
+        private const val PREF_LATEST_MIN_DEFAULT = "10"
+        private const val PREF_PORNSTARS_KEY = "pornstar_cache"
+        private const val PREF_PORNSTARS_TIME_KEY = "pornstar_cache_time"
     }
 }
